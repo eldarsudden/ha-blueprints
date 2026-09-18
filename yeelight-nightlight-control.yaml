@@ -1,0 +1,225 @@
+blueprint:
+  name: "Yeelight — Nightlight Mode Toggle v2"
+  description: >
+    По триггеру переключает режим (yeelight.set_mode) у ламп Yeelight в
+    заданной Area между обычным режимом и Nightlight: один и тот же
+    триггер попеременно включает Nightlight всем лампам и возвращает их
+    обратно в обычный режим.
+
+    Текущий режим определяется по виртуальным nightlight-сущностям.
+    В зависимости от настройки nightlight_switch_type у интеграции
+    Yeelight это может быть light.*_nightlight (nightlight_switch_type:
+    light) ИЛИ switch.*_nightlight (nightlight_switch_type: switch) —
+    v2 распознаёт оба варианта автоматически, без ручной настройки.
+
+    Можно не указывать nightlight-сущности явно — блюпринт сам найдёт их
+    по устройствам ламп в выбранной области, либо задать конкретные
+    сущности вручную.
+
+    Из найденных nightlight-сущностей в первую очередь учитываются только
+    те, чья основная лампа сейчас включена; если включённых ламп нет —
+    учитываются все.
+  domain: automation
+  source_url: https://community.home-assistant.io/
+
+  input:
+    trigger_section:
+      name: "Триггер"
+      icon: mdi:gesture-tap-button
+      collapsed: false
+      input:
+        trigger_source:
+          name: "Триггер"
+          description: >
+            Событие/устройство, которое запускает переключение режима
+            (например нажатие кнопки, датчик и т.д.).
+          selector:
+            trigger: {}
+
+    target_section:
+      name: "Целевая область"
+      icon: mdi:lightbulb-multiple
+      collapsed: false
+      input:
+        target_area:
+          name: "Область (Area) с лампами Yeelight"
+          description: >
+            Лампы Yeelight, для которых будет вызываться yeelight.set_mode.
+          selector:
+            area:
+              entity:
+                - integration: yeelight
+                  domain: light
+
+    control_section:
+      name: "Управление"
+      icon: mdi:light-switch
+      collapsed: false
+      input:
+        nightlight_entities:
+          name: "Nightlight-сущности (опционально)"
+          description: >
+            Если оставить пустым — блюпринт сам найдёт light.*_nightlight
+            и switch.*_nightlight у устройств ламп в выбранной области.
+            Если указать вручную — используются именно эти сущности
+            (без автопоиска по устройствам).
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - integration: yeelight
+                  domain: light
+                - integration: yeelight
+                  domain: switch
+
+        desync_priority:
+          name: "Приоритет при рассинхронизации"
+          description: >
+            Применяется только когда часть проверяемых ламп в Nightlight,
+            а часть — в обычном режиме (когда все лампы уже
+            синхронизированы, блюпринт всегда работает как обычный toggle).
+          default: nightlight
+          selector:
+            select:
+              options:
+                - label: "Переключить все в Nightlight (по умолчанию)"
+                  value: nightlight
+                - label: "Переключить все в обычный режим"
+                  value: normal
+              mode: dropdown
+
+    actions_section:
+      name: "Дополнительные Actions"
+      icon: mdi:script-text
+      collapsed: false
+      input:
+        nightlight_mode_extra_actions:
+          name: "Действия после перехода в Nightlight"
+          description: Выполняются сразу после yeelight.set_mode в Nightlight.
+          default: []
+          selector:
+            action: {}
+
+        normal_extra_actions:
+          name: "Действия после возврата в обычный режим"
+          description: Выполняются сразу после yeelight.set_mode в обычный режим.
+          default: []
+          selector:
+            action: {}
+
+mode: single
+max_exceeded: silent
+
+triggers: !input trigger_source
+
+actions:
+  # Все inputs — сразу переменными (в т.ч. списки extra-actions: без этого
+  # "{{ (nightlight_mode_extra_actions | count) > 0 }}" ниже видел бы
+  # undefined и условие всегда было бы false).
+  - variables:
+      selected_area: !input target_area
+      nightlight_override: !input nightlight_entities
+      desync_priority: !input desync_priority
+      nightlight_mode_extra_actions: !input nightlight_mode_extra_actions
+      normal_extra_actions: !input normal_extra_actions
+
+  # "Основные" light-сущности в области (виртуальные *_nightlight
+  # исключены — это индикаторы/переключатели режима, а не сами лампы).
+  - variables:
+      area_lights: >-
+        {{ area_entities(selected_area)
+           | select('match', '^light\.')
+           | reject('match', '^light\..*nightlight')
+           | list }}
+
+  # Сущности, по которым определяем текущий режим: заданные вручную
+  # (если есть) — иначе автопоиск по устройствам area_lights. Ищем сразу
+  # оба варианта: light.*_nightlight И switch.*_nightlight, в зависимости
+  # от того, как настроен nightlight_switch_type у конкретной лампы.
+  - variables:
+      nightlight_targets: >-
+        {% if nightlight_override | count > 0 %}
+          {{ nightlight_override }}
+        {% else %}
+          {% set ns = namespace(list=[]) %}
+          {% for light in area_lights %}
+            {% set dev_id = device_id(light) %}
+            {% if dev_id %}
+              {% set nl = device_entities(dev_id)
+                 | select('match', '^(light|switch)\..*nightlight')
+                 | list %}
+              {% set ns.list = ns.list + nl %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.list | unique | list }}
+        {% endif %}
+
+  # Из nightlight_targets оставляем только те, чья основная лампа (того же
+  # устройства, не *_nightlight) сейчас включена.
+  - variables:
+      targets_with_on_light: >-
+        {% set ns = namespace(list=[]) %}
+        {% for nl in nightlight_targets %}
+          {% set dev_id = device_id(nl) %}
+          {% set dev_lights = (device_entities(dev_id) if dev_id else [])
+             | select('match', '^light\.')
+             | reject('match', '^light\..*nightlight')
+             | list %}
+          {% if dev_lights | select('is_state', 'on') | list | count > 0 %}
+            {% set ns.list = ns.list + [nl] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.list }}
+
+  # Если есть nightlight-сущности с включённой основной лампой — проверяем
+  # только их. Если ни одна лампа не включена — проверяем весь список
+  # (fallback), чтобы триггер всё равно сработал.
+  - variables:
+      ref_nightlight_targets: >-
+        {{ targets_with_on_light if targets_with_on_light | count > 0
+           else nightlight_targets }}
+      ref_total: "{{ ref_nightlight_targets | count }}"
+      nightlight_on_count: >-
+        {{ ref_nightlight_targets | select('is_state', 'on') | list | count }}
+
+  # Итоговое целевое состояние (true = включить Nightlight всем,
+  # false = вернуть всех в обычный режим).
+  #   ref_total == 0                   → normal (нет данных)
+  #   nightlight_on_count == 0         → все сейчас в normal  → toggle в Nightlight
+  #   nightlight_on_count == ref_total → все сейчас в Nightlight → toggle в normal
+  #   иначе (рассинхронизация)         → решает desync_priority
+  - variables:
+      target_nightlight_mode: >-
+        {% if ref_total == 0 %}
+          {{ false }}
+        {% elif nightlight_on_count == 0 %}
+          {{ true }}
+        {% elif nightlight_on_count == ref_total %}
+          {{ false }}
+        {% else %}
+          {{ desync_priority == 'nightlight' }}
+        {% endif %}
+
+  # Один вызов сервиса на всю область — режим выбирается шаблоном,
+  # вместо двух дублирующихся веток "moonlight"/"normal".
+  - action: yeelight.set_mode
+    target:
+      area_id: !input target_area
+    data:
+      mode: "{{ 'moonlight' if target_nightlight_mode else 'normal' }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ target_nightlight_mode
+                 and (nightlight_mode_extra_actions | count) > 0 }}
+        sequence: !input nightlight_mode_extra_actions
+
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ not target_nightlight_mode
+                 and (normal_extra_actions | count) > 0 }}
+        sequence: !input normal_extra_actions

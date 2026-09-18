@@ -1,0 +1,108 @@
+blueprint:
+  name: Lock Auto-close with Passage Mode
+  description: >
+    Закрывает замок при закрытии двери, если текущее время не попадает
+    в интервал прохода (Passage Mode). Поддерживает задержку перед закрытием.
+    Также автоматически закрывает замок в момент окончания интервала
+    прохода, если к этому моменту он остался открытым.
+  domain: automation
+  input:
+    lock_entity:
+      name: Замок
+      description: Замок, который нужно закрыть.
+      selector:
+        entity:
+          domain: lock
+    door_sensor:
+      name: Датчик двери
+      description: Датчик, который сообщает, что дверь закрыта.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: door
+    lock_delay:
+      name: Задержка перед закрытием
+      description: >
+        Пауза после закрытия двери, прежде чем замок будет заблокирован.
+        Если дверь снова откроется в течение этой паузы — закрытие отменяется.
+        Оставьте 0, чтобы закрывать сразу.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 600
+          unit_of_measurement: "сек"
+          mode: box
+
+    passage_mode:
+      name: Passage Mode
+      icon: mdi:door-open
+      description: >
+        Интервал времени, в течение которого автозакрытие отключено.
+        Необязательно — если оставить оба значения одинаковыми
+        (по умолчанию 00:00:00), интервал не действует и замок
+        закрывается в любое время.
+      collapsed: true
+      input:
+        passage_start_time:
+          name: Начало интервала прохода
+          description: Время, когда замок перестаёт автозакрываться.
+          default: "00:00:00"
+          selector:
+            time: {}
+        passage_end_time:
+          name: Конец интервала прохода
+          description: >
+            Время, когда автозакрытие снова становится активным. Если
+            в этот момент замок открыт — он будет заблокирован.
+          default: "00:00:00"
+          selector:
+            time: {}
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: !input door_sensor
+    from: "on"
+    to: "off"
+    id: door_closed
+  - platform: time
+    at: !input passage_end_time
+    id: passage_end
+
+condition: []
+
+action:
+  - choose:
+      # Сценарий 1: дверь закрылась и мы не в интервале прохода
+      - conditions:
+          - condition: trigger
+            id: door_closed
+          - condition: not
+            conditions:
+              - condition: time
+                after: !input passage_start_time
+                before: !input passage_end_time
+        sequence:
+          - delay:
+              seconds: !input lock_delay
+          - condition: state
+            entity_id: !input door_sensor
+            state: "off"
+          - service: lock.lock
+            target:
+              entity_id: !input lock_entity
+
+      # Сценарий 2: наступил конец интервала прохода — если замок открыт, закрыть
+      - conditions:
+          - condition: trigger
+            id: passage_end
+          - condition: state
+            entity_id: !input lock_entity
+            state: "unlocked"
+        sequence:
+          - service: lock.lock
+            target:
+              entity_id: !input lock_entity

@@ -1,0 +1,379 @@
+blueprint:
+  name: "Light / Nightlight Controller v5"
+  description: >
+    Универсальное управление светильниками с учетом Nightlight (в т.ч.
+    Yeelight, но не только). Для каждого выбранного обычного light.*
+    автоматически проверяется соответствующий light.*_nightlight, если
+    он существует у данной интеграции.
+
+    v5 — упрощение и ускорение: вместо двух параллельных веток
+    (control_normal / control_nightlight) с дублирующейся логикой
+    теперь один общий список control_entities и ОДИН вызов сервиса
+    на операцию (turn_on/turn_off/toggle). Интеграция сама рассылает
+    команды по всем entity_id из списка асинхронно — отдельный
+    `parallel:` для этого не нужен, а кода вдвое меньше.
+
+    Для Toggle доступен режим синхронизации состояний (majority /
+    any_off_on / any_on_off / individual) — решает проблему
+    рассинхронизации при групповом переключении.
+  domain: automation
+
+  input:
+    trigger_section:
+      name: "Триггер"
+      icon: mdi:gesture-tap-button
+      collapsed: false
+      input:
+        triggers:
+          name: "Триггеры"
+          description: "Один или несколько триггеров, запускающих Blueprint."
+          selector:
+            trigger: {}
+
+    target_section:
+      name: "Целевые светильники"
+      icon: mdi:lightbulb-multiple
+      collapsed: false
+      input:
+        target:
+          name: "Lights / Areas / Devices"
+          description: >
+            Можно выбрать отдельные Light entities, устройства или Area.
+          selector:
+            target:
+              entity:
+                domain: light
+
+    control_section:
+      name: "Управление"
+      icon: mdi:light-switch
+      collapsed: false
+      input:
+        operation:
+          name: "Операция"
+          default: "on"
+          selector:
+            select:
+              options:
+                - label: "Включить"
+                  value: "on"
+                - label: "Выключить"
+                  value: "off"
+                - label: "Переключить"
+                  value: "toggle"
+              mode: dropdown
+
+        toggle_sync_mode:
+          name: "Режим синхронизации Toggle"
+          description: >
+            Как определять итоговое состояние при операции "Переключить",
+            если лампы находятся в разных состояниях. Игнорируется для
+            операций Включить/Выключить.
+          default: "majority"
+          selector:
+            select:
+              options:
+                - label: "Независимо (каждая лампа toggle сама по себе)"
+                  value: "individual"
+                - label: "По большинству состояний"
+                  value: "majority"
+                - label: "Хотя бы одна выключена → включить все"
+                  value: "any_off_on"
+                - label: "Хотя бы одна включена → выключить все"
+                  value: "any_on_off"
+              mode: dropdown
+
+        use_nightlight:
+          name: "Учитывать Nightlight"
+          default: true
+          selector:
+            boolean: {}
+
+        transition:
+          name: "Transition"
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 60
+              step: 0.1
+              unit_of_measurement: "s"
+              mode: box
+
+        brightness:
+          name: "Яркость при включении"
+          description: "0 = не изменять текущую яркость."
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+
+    actions_section:
+      name: "Дополнительные Actions"
+      icon: mdi:script-text
+      collapsed: false
+      input:
+        before_on:
+          name: "Перед включением"
+          default: []
+          selector:
+            action: {}
+
+        after_on:
+          name: "После включения"
+          default: []
+          selector:
+            action: {}
+
+        before_off:
+          name: "Перед выключением"
+          default: []
+          selector:
+            action: {}
+
+        after_off:
+          name: "После выключения"
+          default: []
+          selector:
+            action: {}
+
+        before_toggle:
+          name: "Перед Toggle"
+          default: []
+          selector:
+            action: {}
+
+        after_toggle:
+          name: "После Toggle"
+          default: []
+          selector:
+            action: {}
+
+mode: restart
+
+triggers: !input triggers
+
+actions:
+  # Все inputs — сразу переменными. before_*/after_* обязательно нужны
+  # как variables (не только как !input в sequence ниже), иначе
+  # "{{ (before_on | count) > 0 }}" видит undefined и условие всегда
+  # ложно.
+  - variables:
+      selected_target: !input target
+      selected_operation: !input operation
+      selected_toggle_mode: !input toggle_sync_mode
+      selected_use_nightlight: !input use_nightlight
+      selected_transition: !input transition
+      selected_brightness: !input brightness
+      before_on: !input before_on
+      after_on: !input after_on
+      before_off: !input before_off
+      after_off: !input after_off
+      before_toggle: !input before_toggle
+      after_toggle: !input after_toggle
+
+  # Разворачиваем target (entities / devices / areas) в плоский список entity_id.
+  - variables:
+      resolved_entities: >
+        {% set ns = namespace(items=[]) %}
+        {% if selected_target.entity_id is defined %}
+          {% if selected_target.entity_id is string %}
+            {% set ns.items = ns.items + [selected_target.entity_id] %}
+          {% else %}
+            {% set ns.items = ns.items + selected_target.entity_id %}
+          {% endif %}
+        {% endif %}
+        {% if selected_target.device_id is defined %}
+          {% if selected_target.device_id is string %}
+            {% set ns.items = ns.items + device_entities(selected_target.device_id) %}
+          {% else %}
+            {% for device_id in selected_target.device_id %}
+              {% set ns.items = ns.items + device_entities(device_id) %}
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+        {% if selected_target.area_id is defined %}
+          {% if selected_target.area_id is string %}
+            {% set ns.items = ns.items + area_entities(selected_target.area_id) %}
+          {% else %}
+            {% for area_id in selected_target.area_id %}
+              {% set ns.items = ns.items + area_entities(area_id) %}
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+        {{ ns.items | unique | list }}
+
+  # Оставляем только "базовые" light.* (без уже готовых *_nightlight —
+  # их подставим сами, по одному на лампу, если они активны).
+  - variables:
+      lights: >
+        {% set ns = namespace(items=[]) %}
+        {% for entity_id in resolved_entities %}
+          {% if entity_id.startswith('light.')
+              and not entity_id.endswith('_nightlight') %}
+            {% set ns.items = ns.items + [entity_id] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.items | unique | list }}
+
+  # Для каждой лампы выбираем один "управляющий" entity: её nightlight,
+  # если он сейчас активен, иначе саму лампу. Результат — единый список,
+  # на который дальше идёт ОДИН вызов сервиса (без дублирования веток
+  # normal/nightlight и без parallel — интеграция сама распараллелит
+  # рассылку команд по entity_id).
+  - variables:
+      control_entities: >
+        {% set ns = namespace(items=[]) %}
+        {% for e in lights %}
+          {% set nl = e ~ '_nightlight' %}
+          {% set ns.items = ns.items +
+             [nl if (selected_use_nightlight and states(nl) == 'on') else e] %}
+        {% endfor %}
+        {{ ns.items }}
+
+  # Считаем текущее состояние группы — нужно только для режимов
+  # синхронизации Toggle.
+  - variables:
+      on_count: "{{ control_entities | select('is_state', 'on') | list | count }}"
+      total_count: "{{ control_entities | count }}"
+
+  # Для Toggle заранее решаем итоговое состояние всей группы (или
+  # оставляем 'individual' — каждая лампа переключается сама).
+  # При равенстве голосов ("majority", чётное число ламп 50/50) —
+  # решение в пользу выключения (предсказуемее случайного выбора).
+  - variables:
+      effective_operation: >
+        {% if selected_operation != 'toggle' %}
+          {{ selected_operation }}
+        {% elif selected_toggle_mode == 'majority' %}
+          {{ 'off' if on_count * 2 >= total_count else 'on' }}
+        {% elif selected_toggle_mode == 'any_off_on' %}
+          {{ 'on' if on_count < total_count else 'off' }}
+        {% elif selected_toggle_mode == 'any_on_off' %}
+          {{ 'off' if on_count > 0 else 'on' }}
+        {% else %}
+          individual
+        {% endif %}
+
+  # before_* хуки — привязаны к исходной выбранной операции, выполняются
+  # последовательно, как задал пользователь в UI (как и было раньше).
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'on' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (before_on | count) > 0 }}"
+                sequence: !input before_on
+
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'off' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (before_off | count) > 0 }}"
+                sequence: !input before_off
+
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'toggle' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (before_toggle | count) > 0 }}"
+                sequence: !input before_toggle
+
+  # Единственный блок управления лампами: один список entity_id,
+  # один вызов сервиса на операцию.
+  - if:
+      - condition: template
+        value_template: "{{ total_count > 0 }}"
+    then:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ effective_operation == 'on' }}"
+            sequence:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ selected_brightness | int > 0 }}"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: "{{ control_entities }}"
+                        data:
+                          brightness_pct: "{{ selected_brightness | int }}"
+                          transition: "{{ selected_transition | float }}"
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ selected_brightness | int == 0 }}"
+                    sequence:
+                      - action: light.turn_on
+                        target:
+                          entity_id: "{{ control_entities }}"
+                        data:
+                          transition: "{{ selected_transition | float }}"
+
+          - conditions:
+              - condition: template
+                value_template: "{{ effective_operation == 'off' }}"
+            sequence:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ control_entities }}"
+                data:
+                  transition: "{{ selected_transition | float }}"
+
+          - conditions:
+              - condition: template
+                value_template: "{{ effective_operation == 'individual' }}"
+            sequence:
+              - action: light.toggle
+                target:
+                  entity_id: "{{ control_entities }}"
+                data:
+                  transition: "{{ selected_transition | float }}"
+
+  # after_* хуки — тоже привязаны к исходной операции, выполняются
+  # последовательно (как в предыдущей версии).
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'on' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (after_on | count) > 0 }}"
+                sequence: !input after_on
+
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'off' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (after_off | count) > 0 }}"
+                sequence: !input after_off
+
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_operation == 'toggle' }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ (after_toggle | count) > 0 }}"
+                sequence: !input after_toggle
+

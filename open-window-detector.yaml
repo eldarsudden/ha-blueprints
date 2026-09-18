@@ -1,0 +1,166 @@
+blueprint:
+  name: Open Window Detector v3
+  description: >
+    Автоматика для отключения климатических устройств (термостаты, кондиционеры)
+    при открытии окна/двери и их восстановления при закрытии.
+
+    Версия 2: поддерживает два режима восстановления состояния —
+    "снапшот" (текущее состояние climate-устройств фиксируется в момент
+    срабатывания датчика на открытие, до выполнения любых действий,
+    и обновляется при каждом новом срабатывании) и "фиксированное состояние"
+    (при закрытии устройства переводятся в заданный пользователем набор
+    действий, а не в то состояние, которое было до выключения).
+
+    Поддерживается:
+      - произвольный список climate-устройств для управления;
+      - защита от дребезга датчика (anti-flapping) — задержка перед
+        реакцией на изменение состояния;
+      - дополнительные пользовательские действия, выполняемые после
+        выключения и после восстановления устройств.
+
+    Требуется Home Assistant 2024.4 или новее (используется переменная `this`).
+    Датчик-триггер должен быть binary_sensor, где состояние "on" означает
+    "открыто" (стандартное поведение для device_class window/door/opening).
+  domain: automation
+  source_url: https://www.home-assistant.io/docs/blueprint/
+  input:
+    trigger_sensor:
+      name: Датчик-триггер
+      description: >
+        Бинарный датчик окна/двери. Состояние "on" считается "открыто"
+        (climate выключается), "off" — "закрыто" (climate восстанавливается).
+      selector:
+        entity:
+          domain: binary_sensor
+
+    climate_entities:
+      name: Климатические устройства
+      description: Термостаты / кондиционеры, которые нужно выключать и восстанавливать.
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+
+    restore_mode:
+      name: Режим восстановления состояния
+      description: >
+        Снапшот — состояние устройств (режим, температура, fan_mode и т.д.)
+        фиксируется в момент срабатывания на открытие, до выполнения
+        каких-либо действий, и обновляется при каждом новом срабатывании.
+        Фиксированное состояние — при закрытии выполняются заданные
+        вами действия (ниже), а не восстановление предыдущего состояния.
+      default: snapshot
+      selector:
+        select:
+          options:
+            - label: "Снапшот (сохранить текущее состояние)"
+              value: snapshot
+            - label: "Фиксированное состояние (задать вручную)"
+              value: fixed
+
+    fixed_state_action:
+      name: Действия для фиксированного состояния
+      description: >
+        Используется только при выборе режима "Фиксированное состояние".
+        Опишите здесь действия, которые нужно выполнить для перевода
+        климатических устройств в заданное состояние (например,
+        climate.set_hvac_mode + climate.set_temperature).
+      default: []
+      selector:
+        action: {}
+
+    flapping_delay:
+      name: Задержка от дребезга (anti-flapping)
+      description: >
+        Время в секундах, в течение которого состояние датчика должно
+        оставаться стабильным, прежде чем автоматика сработает.
+        Помогает избежать частых включений/выключений при "дребезжащем" датчике.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 600
+          unit_of_measurement: seconds
+          mode: box
+
+    actions_after_off:
+      name: Действия после выключения
+      description: Дополнительные действия, выполняемые сразу после выключения климата.
+      default: []
+      selector:
+        action: {}
+
+    actions_after_on:
+      name: Действия после включения
+      description: Дополнительные действия, выполняемые сразу после восстановления климата.
+      default: []
+      selector:
+        action: {}
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  climate_entities: !input climate_entities
+  restore_mode: !input restore_mode
+  scene_object_id: "climate_snapshot_{{ this.entity_id.split('.')[1] }}"
+
+trigger:
+  - platform: state
+    entity_id: !input trigger_sensor
+    to: "on"
+    for:
+      seconds: !input flapping_delay
+    id: opened
+  - platform: state
+    entity_id: !input trigger_sensor
+    from: "on"
+    for:
+      seconds: !input flapping_delay
+    id: closed
+
+condition: []
+
+action:
+  - choose:
+      # --- Триггер "открыто" ---
+      - conditions:
+          - condition: trigger
+            id: opened
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ restore_mode == 'snapshot' }}"
+                sequence:
+                  - service: scene.create
+                    data:
+                      scene_id: "{{ scene_object_id }}"
+                      snapshot_entities: "{{ climate_entities }}"
+          - service: climate.turn_off
+            target:
+              entity_id: "{{ climate_entities }}"
+          - choose: []
+            default: !input actions_after_off
+
+      # --- Триггер "закрыто" ---
+      - conditions:
+          - condition: trigger
+            id: closed
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ restore_mode == 'snapshot' and
+                         states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count > 0 }}
+                sequence:
+                  - service: scene.turn_on
+                    target:
+                      entity_id: "scene.{{ scene_object_id }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ restore_mode == 'fixed' }}"
+                sequence: !input fixed_state_action
+          - choose: []
+            default: !input actions_after_on

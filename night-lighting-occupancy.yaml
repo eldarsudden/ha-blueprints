@@ -1,0 +1,124 @@
+blueprint:
+  name: "Night Lighting by Occupancy (Full Customization)"
+  description: "Включает свет / Yeelight Moonlight-mode / Ambilight в заданный интервал времени по датчику присутствия. С выбором типа ночного режима и настраиваемым временем автовыключения."
+  domain: automation
+  input:
+    target_area:
+      name: Area
+      description: "Выберите комнату, для которой будет работать сценарий"
+      selector:
+        area: {}
+    night_mode_type:
+      name: Night Mode Type
+      description: "Какой режим использовать как ночной: Moonlight-mode (обычная лампа в лунном режиме) или Ambilight (только фоновая подсветка, если лампа её поддерживает)"
+      default: moonlight
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: "Moonlight mode"
+              value: moonlight
+            - label: "Ambilight (фоновая подсветка)"
+              value: ambilight
+    night_start:
+      name: Start Time
+      description: "Начало ночного режима"
+      default: "00:00:00"
+      selector:
+        time: {}
+    night_end:
+      name: End Time
+      description: "Конец ночного режима"
+      default: "06:00:00"
+      selector:
+        time: {}
+    clear_delay:
+      name: Off Delay
+      description: "Время отсутствия присутствия перед выключением света"
+      default: 60
+      selector:
+        duration: {}
+
+mode: restart
+
+triggers:
+  - trigger: occupancy.detected
+    target:
+      area_id: !input target_area
+    options:
+      behavior: each
+  - trigger: occupancy.cleared
+    target:
+      area_id: !input target_area
+    options:
+      behavior: each
+      for: !input clear_delay
+
+conditions: []
+
+variables:
+  target_area: !input target_area
+  night_mode_type: !input night_mode_type
+  ambilight_entities: >-
+    {{ area_entities(target_area) | select('match', '.*_ambilight$') | list }}
+  main_entities: >-
+    {{ area_entities(target_area)
+       | select('match', '^light\..*')
+       | reject('match', '.*_ambilight$')
+       | list }}
+
+actions:
+  - choose:
+      - conditions:
+          - condition: time
+            after: !input night_start
+            before: !input night_end
+          - condition: occupancy.is_detected
+            target:
+              area_id: !input target_area
+            options:
+              behavior: any
+        sequence:
+          - choose:
+              # --- Ночной режим: Moonlight ---
+              - conditions:
+                  - condition: template
+                    value_template: "{{ night_mode_type == 'moonlight' }}"
+                sequence:
+                  - action: yeelight.set_mode
+                    data:
+                      mode: moonlight
+                    target:
+                      area_id: !input target_area
+                  - action: light.turn_on
+                    target:
+                      entity_id: "{{ main_entities }}"
+                    data: {}
+                  - action: light.turn_off
+                    target:
+                      entity_id: "{{ ambilight_entities }}"
+                    data: {}
+              # --- Ночной режим: Ambilight ---
+              - conditions:
+                  - condition: template
+                    value_template: "{{ night_mode_type == 'ambilight' }}"
+                sequence:
+                  - action: light.turn_off
+                    target:
+                      entity_id: "{{ main_entities }}"
+                    data: {}
+                  - action: light.turn_on
+                    target:
+                      entity_id: "{{ ambilight_entities }}"
+                    data: {}
+      - conditions:
+          - condition: occupancy.is_not_detected
+            target:
+              area_id: !input target_area
+            options:
+              behavior: any
+        sequence:
+          - action: light.turn_off
+            target:
+              area_id: !input target_area
+            data: {}

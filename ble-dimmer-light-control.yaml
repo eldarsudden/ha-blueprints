@@ -1,0 +1,255 @@
+blueprint:
+  name: BLE Dimmer Light Control
+  description: >-
+    Control a light with a BLE dimmer/scene switch that exposes itself as
+    a Home Assistant `event` entity. Press toggles the light; plain
+    rotation (rotate_left / rotate_right) steps EACH light's own current
+    brightness individually, never going below the configured minimum
+    (optionally restricted to lights already on — see "Don't Turn On
+    Lights by Rotating" below); rotating WHILE THE BUTTON IS HELD
+    (rotate_left_pressed / rotate_right_pressed) cycles EACH light's own
+    current hue individually. No separate reference light is needed —
+    every light reads and updates its own state. Supports excluding
+    specific lights from an area/device target.
+  domain: automation
+  input:
+    dimmer_sensor:
+      name: Dimmer Event Entity
+      description: >-
+        The `event.` entity for the BLE dimmer (fires an `event_type`
+        attribute such as press / long_press / rotate_left / rotate_right
+        each time it changes state).
+      selector:
+        entity:
+          domain: event
+    target_light:
+      name: Rotate Target Light(s)
+      description: The light(s) this dimmer should control. Can be entities, devices, or areas.
+      selector:
+        target:
+          entity:
+            domain: light
+    exclude_lights:
+      name: Rotate Exclude Light(s)
+      description: >-
+        Optional. Light entities to always leave out, even if they're
+        part of a selected area/device above (e.g. pick an area but
+        exclude one fixture in it). Only affects the built-in brightness
+        and color actions below — not your custom Short/Long Press
+        Actions, which target whatever you configured in them.
+      default: []
+      selector:
+        entity:
+          domain: light
+          multiple: true
+    short_press_action:
+      name: Short Press Action
+      description: Service call to run on a short press (defaults to toggling the light).
+      default:
+        - service: light.toggle
+          data: {}
+          target: {}
+      selector:
+        action: {}
+    long_press_action:
+      name: Long Press Action
+      description: Optional service call to run on a long press. Leave empty to do nothing.
+      default: []
+      selector:
+        action: {}
+    long_press_debounce:
+      name: Long Press Debounce (seconds)
+      description: >-
+        Many dimmers keep re-firing long_press repeatedly the entire
+        time the button stays held down. This sets how long to wait
+        after running the Long Press Action before another long_press
+        event is allowed to trigger it again, so holding the button
+        doesn't run the action over and over. Set to 0 to disable
+        debouncing (run on every repeat).
+      default: 3.5
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 0.5
+          mode: slider
+    brightness_step_pct:
+      name: Brightness Step (%)
+      description: >-
+        How much brightness changes per plain rotate click. Increase for
+        faster dimming, decrease for finer control.
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: slider
+    min_brightness_pct:
+      name: Minimum Brightness (%)
+      description: >-
+        Rotating down (rotate_left) will never take any light below this
+        brightness — each light stops here individually instead of
+        reaching 0/off.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: slider
+    restrict_rotate_to_on_lights:
+      name: Don't Turn On Lights by Rotating
+      description: >-
+        If on, plain rotation (rotate_left/rotate_right) only adjusts
+        brightness on lights in the target that are already on — lights
+        that are off stay off. If off, rotating adjusts (and turns on)
+        every light in the target regardless of its current state.
+      default: true
+      selector:
+        boolean: {}
+    enable_pressed_rotate_color:
+      name: Enable Color on Pressed Rotate
+      description: >-
+        If on, rotate_left_pressed/rotate_right_pressed events cycle the
+        light's color/hue. If off, those events are ignored entirely.
+      default: false
+      selector:
+        boolean: {}
+    color_step_degrees:
+      name: Color Step (degrees)
+      description: How far around the hue wheel each pressed-rotate click moves.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 90
+          step: 5
+          mode: slider
+
+variables:
+  target_light: !input target_light
+  exclude_lights: !input exclude_lights
+  step_pct: !input brightness_step_pct
+  restrict_rotate_to_on_lights: !input restrict_rotate_to_on_lights
+  min_brightness_pct: !input min_brightness_pct
+  enable_pressed_rotate_color: !input enable_pressed_rotate_color
+  color_step_degrees: !input color_step_degrees
+  long_press_debounce: !input long_press_debounce
+
+trigger:
+  - platform: state
+    entity_id: !input dimmer_sensor
+
+condition: []
+
+action:
+  - variables:
+      event_type: "{{ trigger.to_state.attributes.event_type }}"
+      prev_event_type: "{{ trigger.from_state.attributes.event_type if trigger.from_state else None }}"
+      seconds_since_prev_event: >-
+        {{ (as_timestamp(trigger.to_state.last_changed) - as_timestamp(trigger.from_state.last_changed))
+           if trigger.from_state else 999 }}
+      is_repeat_long_press: >-
+        {{ event_type == 'long_press' and prev_event_type == 'long_press'
+           and seconds_since_prev_event < long_press_debounce }}
+      resolved_target_entities: >-
+        {%- set explicit = target_light.entity_id if target_light.entity_id is defined else [] -%}
+        {%- set explicit = explicit if explicit is iterable and explicit is not string else [explicit] -%}
+        {%- set areas = target_light.area_id if target_light.area_id is defined else [] -%}
+        {%- set areas = areas if areas is iterable and areas is not string else [areas] -%}
+        {%- set devices = target_light.device_id if target_light.device_id is defined else [] -%}
+        {%- set devices = devices if devices is iterable and devices is not string else [devices] -%}
+        {%- set area_ents = areas | map('area_entities') | sum(start=[]) -%}
+        {%- set device_ents = devices | map('device_entities') | sum(start=[]) -%}
+        {%- set all_ents = explicit + area_ents + device_ents -%}
+        {%- set ns = namespace(final=[]) -%}
+        {%- for e in all_ents -%}
+          {%- if e.startswith('light.') and e not in exclude_lights and e not in ns.final -%}
+            {%- set ns.final = ns.final + [e] -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ ns.final }}
+      on_target_entities: >-
+        {%- set ns = namespace(final=[]) -%}
+        {%- for e in resolved_target_entities -%}
+          {%- if is_state(e, 'on') -%}
+            {%- set ns.final = ns.final + [e] -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ ns.final }}
+      rotate_target_entities: >-
+        {{ on_target_entities if restrict_rotate_to_on_lights else resolved_target_entities }}
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'press' }}"
+        sequence: !input short_press_action
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'long_press' and not is_repeat_long_press }}"
+        sequence: !input long_press_action
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'rotate_right' and rotate_target_entities | length > 0 }}"
+        sequence:
+          - repeat:
+              for_each: "{{ rotate_target_entities }}"
+              sequence:
+                - service: light.turn_on
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    brightness_pct: >-
+                      {%- set cur = ((state_attr(repeat.item, 'brightness') / 255 * 100) | round(0))
+                         if state_attr(repeat.item, 'brightness') else 0 -%}
+                      {{ [cur + step_pct, 100] | min | round(0) }}
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'rotate_left' and rotate_target_entities | length > 0 }}"
+        sequence:
+          - repeat:
+              for_each: "{{ rotate_target_entities }}"
+              sequence:
+                - service: light.turn_on
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    brightness_pct: >-
+                      {%- set cur = ((state_attr(repeat.item, 'brightness') / 255 * 100) | round(0))
+                         if state_attr(repeat.item, 'brightness') else 0 -%}
+                      {{ [cur - step_pct, min_brightness_pct] | max | round(0) }}
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'rotate_right_pressed' and enable_pressed_rotate_color }}"
+        sequence:
+          - repeat:
+              for_each: "{{ rotate_target_entities }}"
+              sequence:
+                - service: light.turn_on
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    hs_color: >-
+                      {%- set hs = state_attr(repeat.item, 'hs_color') -%}
+                      {%- set hue = hs[0] if hs else 0 -%}
+                      {%- set sat = hs[1] if hs else 100 -%}
+                      {{ [ (hue + color_step_degrees) % 360, sat ] }}
+      - conditions:
+          - condition: template
+            value_template: "{{ event_type == 'rotate_left_pressed' and enable_pressed_rotate_color }}"
+        sequence:
+          - repeat:
+              for_each: "{{ rotate_target_entities }}"
+              sequence:
+                - service: light.turn_on
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    hs_color: >-
+                      {%- set hs = state_attr(repeat.item, 'hs_color') -%}
+                      {%- set hue = hs[0] if hs else 0 -%}
+                      {%- set sat = hs[1] if hs else 100 -%}
+                      {{ [ (hue - color_step_degrees) % 360, sat ] }}
+
+mode: single

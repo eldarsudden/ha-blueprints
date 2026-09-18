@@ -1,0 +1,157 @@
+blueprint:
+  name: "Climate Controller v1"
+  description: >
+    Климат: выключение при открытии окна/двери и восстановление при закрытии
+    Отслеживает бинарный сенсор (например, датчик открытия окна или двери) и:
+
+      • при переходе в состояние "открыто" — выключает выбранные климатические
+        устройства (термостаты, кондиционеры), предварительно сохранив их
+        текущее состояние (режим, температуру, вентилятор и т.д.);
+
+      • при переходе в состояние "закрыто" — восстанавливает климатические
+        устройства ровно в то состояние, в котором они были до выключения.
+
+    Для каждого из двух событий можно задать дополнительные произвольные
+    действия (actions), которые выполнятся после основного шага.
+
+    Есть настройка задержки ("for"), которая требует, чтобы состояние
+    сенсора оставалось неизменным заданное время, прежде чем автоматика
+    сработает — это защищает от "дребезга" (flapping) при частом
+    открытии/закрытии.
+  domain: automation
+  homeassistant:
+    min_version: 2023.9.0
+  input:
+    trigger_entity:
+      name: Сенсор-триггер
+      description: >
+        Бинарный сенсор, который запускает автоматику (например, датчик
+        открытия окна/двери, class "opening" или "door"/"window").
+      selector:
+        entity:
+          domain: binary_sensor
+
+    open_state:
+      name: Состояние "открыто"
+      description: Состояние сенсора, при котором климат-устройства выключаются.
+      default: "on"
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: "on (вкл / открыто)"
+              value: "on"
+            - label: "off (выкл / закрыто)"
+              value: "off"
+
+    closed_state:
+      name: Состояние "закрыто"
+      description: >
+        Состояние сенсора, при котором климат-устройства включаются обратно
+        и восстанавливается их предыдущее состояние. Должно отличаться от
+        состояния "открыто".
+      default: "off"
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: "on (вкл / открыто)"
+              value: "on"
+            - label: "off (выкл / закрыто)"
+              value: "off"
+
+    climate_entities:
+      name: Климатические устройства
+      description: >
+        Термостаты / кондиционеры, которые нужно выключать при открытии и
+        включать обратно (с восстановлением состояния) при закрытии.
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+
+    flapping_delay:
+      name: Задержка перед срабатыванием (защита от дребезга)
+      description: >
+        Состояние сенсора должно оставаться неизменным это время, прежде чем
+        сработает выключение или включение. Полезно, если окно/дверь могут
+        кратковременно хлопнуть или сенсор "дребезжит". Например: 5-10 секунд.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 0
+      selector:
+        duration: {}
+
+    actions_after_off:
+      name: Дополнительные действия после выключения
+      description: >
+        Необязательные действия, которые выполнятся сразу после выключения
+        климат-устройств (например, уведомление, включение вентилятора,
+        логирование и т.п.).
+      default: []
+      selector:
+        action: {}
+
+    actions_after_on:
+      name: Дополнительные действия после включения обратно
+      description: >
+        Необязательные действия, которые выполнятся сразу после того, как
+        климат-устройства будут возвращены в предыдущее состояние.
+      default: []
+      selector:
+        action: {}
+
+mode: single
+
+variables:
+  climate_entities: !input climate_entities
+  # Уникальный, но стабильный id сцены-снапшота, привязанный к конкретному
+  # экземпляру автоматики (чтобы разные использования этого blueprint
+  # не конфликтовали друг с другом).
+  scene_id: "climate_backup_{{ this.entity_id.split('.')[1] }}"
+
+trigger:
+  - platform: state
+    entity_id: !input trigger_entity
+    to: !input open_state
+    for: !input flapping_delay
+    id: "opened"
+  - platform: state
+    entity_id: !input trigger_entity
+    to: !input closed_state
+    for: !input flapping_delay
+    id: "closed"
+
+condition: []
+
+action:
+  - choose:
+      # --- Сработал триггер "открыто": сохраняем состояние и выключаем ---
+      - conditions:
+          - condition: trigger
+            id: "opened"
+        sequence:
+          - action: scene.create
+            data:
+              scene_id: "{{ scene_id }}"
+              snapshot_entities: "{{ climate_entities }}"
+          - action: climate.turn_off
+            target:
+              entity_id: "{{ climate_entities }}"
+          - choose: []
+            default: !input actions_after_off
+
+      # --- Сработал триггер "закрыто": восстанавливаем сохранённое состояние ---
+      - conditions:
+          - condition: trigger
+            id: "closed"
+        sequence:
+          - condition: template
+            value_template: "{{ states('scene.' ~ scene_id) not in ['unknown', 'unavailable', 'none'] }}"
+          - action: scene.turn_on
+            target:
+              entity_id: "scene.{{ scene_id }}"
+          - choose: []
+            default: !input actions_after_on
+

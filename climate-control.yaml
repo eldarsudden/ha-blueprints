@@ -147,8 +147,6 @@ action:
           - condition: trigger
             id: "closed"
         sequence:
-          - condition: template
-            value_template: "{{ states('scene.' ~ scene_id) not in ['unknown', 'unavailable', 'none'] }}"
           - action: scene.turn_on
             target:
               entity_id: "scene.{{ scene_id }}"

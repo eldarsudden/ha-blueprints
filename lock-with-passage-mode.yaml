@@ -20,19 +20,28 @@ blueprint:
         entity:
           domain: binary_sensor
           device_class: door
-    lock_delay:
-      name: Задержка перед закрытием
+     lock_delay:
+       name: Задержка перед закрытием
+       description: >
+         Пауза после закрытия двери, прежде чем замок будет заблокирован.
+         Если дверь снова откроется в течение этой паузы — закрытие отменяется.
+         Оставьте 0, чтобы закрывать сразу.
+       default: 0
+       selector:
+         number:
+           min: 0
+           max: 600
+           unit_of_measurement: "сек"
+           mode: box
+
+    check_interval:
+      name: Интервал периодической проверки
       description: >
-        Пауза после закрытия двери, прежде чем замок будет заблокирован.
-        Если дверь снова откроется в течение этой паузы — закрытие отменяется.
-        Оставьте 0, чтобы закрывать сразу.
-      default: 0
+        Интервал (в минутах), через который замок будет проверяться и закрываться,
+        если он открыт и мы не в Passage Mode. Используйте формат /X (например, /15 для каждых 15 минут).
+      default: "/15"
       selector:
-        number:
-          min: 0
-          max: 600
-          unit_of_measurement: "сек"
-          mode: box
+        text: {}
 
     passage_mode:
       name: Passage Mode
@@ -71,6 +80,9 @@ trigger:
   - platform: time
     at: !input passage_end_time
     id: passage_end
+  - platform: time_pattern
+    minutes: !input check_interval
+    id: periodic_check
 
 condition: []
 
@@ -95,14 +107,31 @@ action:
             target:
               entity_id: !input lock_entity
 
-      # Сценарий 2: наступил конец интервала прохода — если замок открыт, закрыть
-      - conditions:
-          - condition: trigger
-            id: passage_end
-          - condition: state
-            entity_id: !input lock_entity
-            state: "unlocked"
-        sequence:
-          - service: lock.lock
-            target:
-              entity_id: !input lock_entity
+       # Сценарий 2: наступил конец интервала прохода — если замок открыт, закрыть
+       - conditions:
+           - condition: trigger
+             id: passage_end
+           - condition: state
+             entity_id: !input lock_entity
+             state: "unlocked"
+         sequence:
+           - service: lock.lock
+             target:
+               entity_id: !input lock_entity
+
+       # Сценарий 3: периодическая проверка — закрыть, если открыт и не в Passage Mode
+       - conditions:
+           - condition: trigger
+             id: periodic_check
+           - condition: state
+             entity_id: !input lock_entity
+             state: "unlocked"
+           - condition: not
+             conditions:
+               - condition: time
+                 after: !input passage_start_time
+                 before: !input passage_end_time
+         sequence:
+           - service: lock.lock
+             target:
+               entity_id: !input lock_entity

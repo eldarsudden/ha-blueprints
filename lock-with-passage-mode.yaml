@@ -5,7 +5,10 @@ blueprint:
     в интервал прохода (Passage Mode). Поддерживает задержку перед закрытием.
     Также автоматически закрывает замок в момент окончания интервала
     прохода, если к этому моменту он остался открытым.
+    Замок никогда не закрывается, пока дверь открыта.
   domain: automation
+  homeassistant:
+    min_version: 2024.10.0
   input:
     lock_entity:
       name: Замок
@@ -20,20 +23,19 @@ blueprint:
         entity:
           domain: binary_sensor
           device_class: door
-     lock_delay:
-       name: Задержка перед закрытием
-       description: >
-         Пауза после закрытия двери, прежде чем замок будет заблокирован.
-         Если дверь снова откроется в течение этой паузы — закрытие отменяется.
-         Оставьте 0, чтобы закрывать сразу.
-       default: 0
-       selector:
-         number:
-           min: 0
-           max: 600
-           unit_of_measurement: "сек"
-           mode: box
-
+    lock_delay:
+      name: Задержка перед закрытием
+      description: >
+        Пауза после закрытия двери, прежде чем замок будет заблокирован.
+        Если дверь снова откроется в течение этой паузы — закрытие отменяется.
+        Оставьте 0, чтобы закрывать сразу.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 600
+          unit_of_measurement: "сек"
+          mode: box
     check_interval:
       name: Интервал периодической проверки
       description: >
@@ -42,7 +44,6 @@ blueprint:
       default: "/15"
       selector:
         text: {}
-
     passage_mode:
       name: Passage Mode
       icon: mdi:door-open
@@ -68,70 +69,97 @@ blueprint:
           selector:
             time: {}
 
-mode: restart
+# single: периодическая проверка / конец интервала не прерывают ожидание
+# задержки и не обходят её.
+mode: single
 max_exceeded: silent
 
-trigger:
-  - platform: state
+variables:
+  passage_start: !input passage_start_time
+  passage_end: !input passage_end_time
+
+triggers:
+  - trigger: state
     entity_id: !input door_sensor
     from: "on"
     to: "off"
     id: door_closed
-  - platform: time
+  - trigger: time
     at: !input passage_end_time
     id: passage_end
-  - platform: time_pattern
+  - trigger: time_pattern
     minutes: !input check_interval
     id: periodic_check
 
-condition: []
+conditions: []
 
-action:
+actions:
   - choose:
       # Сценарий 1: дверь закрылась и мы не в интервале прохода
       - conditions:
           - condition: trigger
             id: door_closed
-          - condition: not
+          - condition: or
             conditions:
-              - condition: time
-                after: !input passage_start_time
-                before: !input passage_end_time
+              # интервал не задан (начало == конец) -> прохода нет
+              - condition: template
+                value_template: "{{ passage_start == passage_end }}"
+              - condition: not
+                conditions:
+                  - condition: time
+                    after: !input passage_start_time
+                    before: !input passage_end_time
         sequence:
           - delay:
               seconds: !input lock_delay
+          # дверь могли снова открыть за время задержки
           - condition: state
             entity_id: !input door_sensor
             state: "off"
-          - service: lock.lock
+          - action: lock.lock
             target:
               entity_id: !input lock_entity
 
-       # Сценарий 2: наступил конец интервала прохода — если замок открыт, закрыть
-       - conditions:
-           - condition: trigger
-             id: passage_end
-           - condition: state
-             entity_id: !input lock_entity
-             state: "unlocked"
-         sequence:
-           - service: lock.lock
-             target:
-               entity_id: !input lock_entity
+      # Сценарий 2: наступил конец интервала прохода — если замок открыт
+      # и дверь закрыта, закрыть замок
+      - conditions:
+          - condition: trigger
+            id: passage_end
+          # при выключенном интервале не срабатывать в 00:00
+          - condition: template
+            value_template: "{{ passage_start != passage_end }}"
+          - condition: state
+            entity_id: !input lock_entity
+            state: "unlocked"
+          - condition: state
+            entity_id: !input door_sensor
+            state: "off"
+        sequence:
+          - action: lock.lock
+            target:
+              entity_id: !input lock_entity
 
-       # Сценарий 3: периодическая проверка — закрыть, если открыт и не в Passage Mode
-       - conditions:
-           - condition: trigger
-             id: periodic_check
-           - condition: state
-             entity_id: !input lock_entity
-             state: "unlocked"
-           - condition: not
-             conditions:
-               - condition: time
-                 after: !input passage_start_time
-                 before: !input passage_end_time
-         sequence:
-           - service: lock.lock
-             target:
-               entity_id: !input lock_entity
+      # Сценарий 3: периодическая проверка — закрыть, если замок открыт,
+      # дверь закрыта и мы не в Passage Mode
+      - conditions:
+          - condition: trigger
+            id: periodic_check
+          - condition: state
+            entity_id: !input lock_entity
+            state: "unlocked"
+          - condition: state
+            entity_id: !input door_sensor
+            state: "off"
+          - condition: or
+            conditions:
+              - condition: template
+                value_template: "{{ passage_start == passage_end }}"
+              - condition: not
+                conditions:
+                  - condition: time
+                    after: !input passage_start_time
+                    before: !input passage_end_time
+        sequence:
+          - action: lock.lock
+            target:
+              entity_id: !input lock_entity

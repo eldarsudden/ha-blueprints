@@ -4,10 +4,10 @@ blueprint:
     Автоматика для отключения климатических устройств (термостаты, кондиционеры)
     при открытии окна/двери и их восстановления при закрытии.
 
-    Версия 2: поддерживает два режима восстановления состояния —
+    Поддерживает два режима восстановления состояния —
     "снапшот" (текущее состояние climate-устройств фиксируется в момент
     срабатывания датчика на открытие, до выполнения любых действий,
-    и обновляется при каждом новом срабатывании) и "фиксированное состояние"
+    и сохраняется до успешного выполнения восстановления) и "фиксированное состояние"
     (при закрытии устройства переводятся в заданный пользователем набор
     действий, а не в то состояние, которое было до выключения).
 
@@ -46,7 +46,8 @@ blueprint:
       description: >
         Снапшот — состояние устройств (режим, температура, fan_mode и т.д.)
         фиксируется в момент срабатывания на открытие, до выполнения
-        каких-либо действий, и обновляется при каждом новом срабатывании.
+        каких-либо действий. Повторное открытие до восстановления не
+        перезаписывает сохранённое состояние уже выключенных устройств.
         Фиксированное состояние — при закрытии выполняются заданные
         вами действия (ниже), а не восстановление предыдущего состояния.
       default: snapshot
@@ -97,8 +98,10 @@ blueprint:
       selector:
         action: {}
 
-mode: restart
-max_exceeded: silent
+# События обрабатываются последовательно, чтобы новое открытие или закрытие
+# не прерывало сохранение и восстановление состояния.
+mode: queued
+max: 10
 
 variables:
   climate_entities: !input climate_entities
@@ -114,7 +117,7 @@ trigger:
     id: opened
   - platform: state
     entity_id: !input trigger_sensor
-    from: "on"
+    to: "off"
     for:
       seconds: !input flapping_delay
     id: closed
@@ -131,7 +134,9 @@ action:
           - choose:
               - conditions:
                   - condition: template
-                    value_template: "{{ restore_mode == 'snapshot' }}"
+                    value_template: >-
+                      {{ restore_mode == 'snapshot' and
+                         states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count == 0 }}
                 sequence:
                   - service: scene.create
                     data:
@@ -156,6 +161,11 @@ action:
                          states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count > 0 }}
                 sequence:
                   - service: scene.turn_on
+                    target:
+                      entity_id: "scene.{{ scene_object_id }}"
+                  # Удаляем снимок только после выполнения восстановления.
+                  # Следующее открытие сохранит актуальное состояние устройств.
+                  - service: scene.delete
                     target:
                       entity_id: "scene.{{ scene_object_id }}"
               - conditions:

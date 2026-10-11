@@ -1,0 +1,173 @@
+blueprint:
+  name: "Light / Nightlight Cycle Control"
+  description: >-
+    Control main lights and nightlights with a single button.
+
+    When both groups are off, turn on the nightlights with the configured
+    brightness and flash. Outside the nighttime interval, also turn on
+    the main lights.
+
+    When only the nightlights are on, turn on both groups without changing
+    their brightness. When only the main lights are on, turn on the
+    nightlights with the configured brightness and flash.
+
+    When both groups are on, or lights within either group have mixed
+    states, turn off all lights.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    button_triggers:
+      name: "Триггеры кнопки"
+      description: >-
+        The button press that cycles the lighting. Select the original
+        MQTT device trigger with the off_b1 action, or any other trigger.
+      selector:
+        trigger: {}
+
+    main_lights:
+      name: "Основное освещение"
+      description: >-
+        Select one or more main lights. Each light must belong to only
+        one group: main lights or nightlights.
+      selector:
+        entity:
+          filter:
+            - domain: light
+          multiple: true
+
+    night_lights:
+      name: "Ночное освещение"
+      description: >-
+        Select one or more nightlights. In the original automation,
+        these are the two entities that turn on at 1% brightness.
+      selector:
+        entity:
+          filter:
+            - domain: light
+          multiple: true
+
+    night_start:
+      name: "Начало ночного интервала"
+      description: >-
+        The start of the nighttime interval. During this interval,
+        pressing the button when both groups are off turns on only the nightlights.
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    night_end:
+      name: "Конец ночного интервала"
+      description: >-
+        The end of the nighttime interval. Outside this interval,
+        pressing the button when both groups are off turns on both groups.
+        The interval can span midnight.
+      default: "06:00:00"
+      selector:
+        time: {}
+
+    night_brightness_pct:
+      name: "Начальная яркость ночного освещения"
+      description: >-
+        The nightlight brightness to use when both groups are off
+        or only the main lights are on.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    night_flash:
+      name: "Вспышка при включении ночного освещения"
+      description: >-
+        The flash duration when turning on the nightlights at the configured
+        brightness. The lights must support this feature.
+      default: long
+      selector:
+        select:
+          options:
+            - label: "Короткая"
+              value: short
+            - label: "Длинная"
+              value: long
+          mode: dropdown
+
+mode: single
+
+triggers: !input button_triggers
+
+conditions: []
+
+actions:
+  - choose:
+      # Обе группы выключены: начинаем с приглушённого ночного света.
+      - conditions:
+          - condition: state
+            entity_id: !input main_lights
+            state: "off"
+          - condition: state
+            entity_id: !input night_lights
+            state: "off"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input night_lights
+            data:
+              brightness_pct: !input night_brightness_pct
+              flash: !input night_flash
+          - if:
+              - condition: time
+                after: !input night_start
+                before: !input night_end
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: !input main_lights
+            else:
+              - action: light.turn_on
+                target:
+                  entity_id: !input main_lights
+
+      # Включён только ночной свет: включаем обе группы, сохраняя яркость.
+      - conditions:
+          - condition: state
+            entity_id: !input main_lights
+            state: "off"
+          - condition: state
+            entity_id: !input night_lights
+            state: "on"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input night_lights
+          - action: light.turn_on
+            target:
+              entity_id: !input main_lights
+
+      # Включён только основной свет: добавляем приглушённый ночной свет.
+      - conditions:
+          - condition: state
+            entity_id: !input main_lights
+            state: "on"
+          - condition: state
+            entity_id: !input night_lights
+            state: "off"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input night_lights
+            data:
+              brightness_pct: !input night_brightness_pct
+              flash: !input night_flash
+
+    # Обе группы включены или имеют смешанное состояние: выключаем всё.
+    default:
+      - action: light.turn_off
+        target:
+          entity_id: !input main_lights
+      - action: light.turn_off
+        target:
+          entity_id: !input night_lights

@@ -1,0 +1,140 @@
+blueprint:
+  name: "Presence Device Control"
+  description: >-
+    Keep selected devices on while presence is detected and turn them off
+    after the configured absence delay. A device switched off during presence
+    is turned back on automatically.
+
+    Select a binary sensor where on means presence and off means absence.
+    Devices must support the Home Assistant turn_on and turn_off actions.
+    Unavailable devices are skipped and handled again when they recover.
+    An unknown or unavailable presence sensor does not change device states.
+
+    The automation also checks device states at Home Assistant startup and
+    once per minute. These checks recover from missed events and restarts;
+    the absence delay starts again after a restart.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    presence_sensor:
+      name: "Датчик присутствия"
+      description: >-
+        Select a presence or motion binary sensor. Its on state must mean
+        presence and its off state must mean absence. A binary sensor group
+        can be used to combine several sensors.
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+
+    controlled_entities:
+      name: "Управляемые устройства"
+      description: >-
+        Select the entities to keep on during presence and turn off during
+        absence. Each selected entity must support turn_on and turn_off.
+        Already active devices retain their current settings; this blueprint
+        does not restore previous brightness, temperature, or other settings.
+      selector:
+        entity:
+          filter:
+            - domain:
+                - light
+                - switch
+                - fan
+                - climate
+                - humidifier
+                - media_player
+                - input_boolean
+          multiple: true
+
+    absence_delay:
+      name: "Задержка выключения при отсутствии"
+      description: >-
+        Presence must remain absent for this duration before devices are
+        turned off. Returning presence cancels the pending shutdown.
+        Set to zero for immediate shutdown.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 0
+      selector:
+        duration: {}
+
+# Последовательная обработка не прерывает команды остальным устройствам.
+mode: queued
+max: 25
+
+variables:
+  controlled_entities: !input controlled_entities
+
+triggers:
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "on"
+    id: presence_detected
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "off"
+    for: !input absence_delay
+    id: presence_cleared
+  # Реагируем на выключение, ручное включение и восстановление доступности.
+  # Изменения атрибутов без изменения состояния не запускают автоматизацию.
+  - trigger: state
+    entity_id: !input controlled_entities
+    to: null
+    id: device_changed
+  - trigger: homeassistant
+    event: start
+    id: startup
+  - trigger: time_pattern
+    minutes: "/1"
+    id: periodic_check
+
+conditions: []
+
+actions:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "on"
+        sequence:
+          - repeat:
+              for_each: "{{ controlled_entities }}"
+              sequence:
+                - if:
+                    # Повторно проверяем присутствие перед каждой командой.
+                    - condition: state
+                      entity_id: !input presence_sensor
+                      state: "on"
+                    - condition: template
+                      value_template: "{{ is_state(repeat.item, 'off') }}"
+                  then:
+                    - action: homeassistant.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item }}"
+
+      - conditions:
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
+            for: !input absence_delay
+        sequence:
+          - repeat:
+              for_each: "{{ controlled_entities }}"
+              sequence:
+                - if:
+                    - condition: state
+                      entity_id: !input presence_sensor
+                      state: "off"
+                      for: !input absence_delay
+                    - condition: template
+                      value_template: >-
+                        {{ states(repeat.item) not in ['off', 'unknown', 'unavailable'] }}
+                  then:
+                    - action: homeassistant.turn_off
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item }}"

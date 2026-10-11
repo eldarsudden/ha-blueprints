@@ -3,21 +3,18 @@ blueprint:
   description: >-
     Control main lights and nightlights with a single button.
 
-    When both groups are off, turn on the nightlights with the configured
-    brightness and flash. Outside the nighttime interval, also turn on
-    the main lights.
+    During the nighttime interval, cycle through three steps: turn on only
+    the nightlights at the configured brightness; add the main lights and
+    enable Yeelight night mode using the selected switches; turn everything
+    off and reset the mode switches.
 
-    When only the nightlights are on, turn on both groups without changing
-    their brightness. When only the main lights are on, turn on the
-    nightlights with the configured brightness and flash.
+    Outside the nighttime interval, toggle both lighting groups on or off
+    in normal mode, without the intermediate nightlight step or a flash.
 
-    When both groups are on, or lights within either group have mixed
-    states, turn off all lights.
-
-    Optionally select a group switch that controls Yeelight night mode.
-    Before turning lights on, enable this switch during the nighttime interval
-    and disable it outside the interval. The mode is updated on button presses,
-    not automatically at the interval boundaries.
+    Mixed or unexpected lighting states are reset by turning everything off.
+    The mode switches also identify the second nighttime step when Yeelight
+    reports the normal-mode light entities as off. The interval is evaluated
+    on button presses; there are no scheduled mode changes.
   domain: automation
   homeassistant:
     min_version: 2024.10.0
@@ -44,8 +41,8 @@ blueprint:
     night_lights:
       name: "Ночное освещение"
       description: >-
-        Select one or more nightlights. In the original automation,
-        these are the two entities that turn on at 1% brightness.
+        Select one or more nightlights for the first nighttime step.
+        They remain on when the main lights are added in the second step.
       selector:
         entity:
           filter:
@@ -57,8 +54,10 @@ blueprint:
       description: >-
         Optional. Select your existing group switch for Yeelight night mode,
         or individual mode switches. Turning the switch on must enable night
-        mode; turning it off must restore normal mode. The mode is set before
-        turning lights on. Leave empty to keep the original behavior.
+        mode; turning it off must restore normal mode. The switches are
+        enabled after the main lights are added in the second nighttime step
+        and disabled when turning everything off or using normal daytime mode.
+        Leave empty to cycle the lights without changing Yeelight mode.
       default: []
       selector:
         entity:
@@ -88,8 +87,8 @@ blueprint:
     night_brightness_pct:
       name: "Начальная яркость ночного освещения"
       description: >-
-        The nightlight brightness to use when both groups are off
-        or only the main lights are on.
+        The nightlight brightness for the first nighttime step.
+        Daytime operation does not override brightness.
       default: 1
       selector:
         number:
@@ -102,8 +101,9 @@ blueprint:
     night_flash:
       name: "Вспышка при включении ночного освещения"
       description: >-
-        The flash duration when turning on the nightlights at the configured
-        brightness. The lights must support this feature.
+        The flash duration for the first nighttime step.
+        The lights must support this feature. No flash is requested during
+        daytime operation or when adding the main lights.
       default: long
       selector:
         select:
@@ -118,129 +118,113 @@ mode: single
 
 variables:
   night_mode_switches: !input night_mode_switches
+  night_mode_active: >-
+    {{ night_mode_switches | select('is_state', 'on') | list | count > 0 }}
 
 triggers: !input button_triggers
 
 conditions: []
 
 actions:
-  - choose:
-      # Обе группы выключены: начинаем с приглушённого ночного света.
-      - conditions:
-          - condition: state
-            entity_id: !input main_lights
-            state: "off"
-          - condition: state
-            entity_id: !input night_lights
-            state: "off"
-        sequence:
-          # Выбор ветки уже выполнен: изменение режима не влияет на её условия.
-          - if:
+  - if:
+      - condition: time
+        after: !input night_start
+        before: !input night_end
+    then:
+      - choose:
+          # Шаг 1: всё выключено — включаем только ночное освещение.
+          - conditions:
+              - condition: state
+                entity_id: !input main_lights
+                state: "off"
+              - condition: state
+                entity_id: !input night_lights
+                state: "off"
               - condition: template
-                value_template: "{{ night_mode_switches | length > 0 }}"
-            then:
-              - if:
-                  - condition: time
-                    after: !input night_start
-                    before: !input night_end
-                then:
-                  - action: switch.turn_on
-                    target:
-                      entity_id: !input night_mode_switches
-                else:
-                  - action: switch.turn_off
-                    target:
-                      entity_id: !input night_mode_switches
-          - action: light.turn_on
-            target:
-              entity_id: !input night_lights
-            data:
-              brightness_pct: !input night_brightness_pct
-              flash: !input night_flash
-          - if:
-              - condition: time
-                after: !input night_start
-                before: !input night_end
-            then:
-              - action: light.turn_off
+                value_template: "{{ not night_mode_active }}"
+            sequence:
+              - action: light.turn_on
                 target:
-                  entity_id: !input main_lights
-            else:
+                  entity_id: !input night_lights
+                data:
+                  brightness_pct: !input night_brightness_pct
+                  flash: !input night_flash
+
+          # Шаг 2: добавляем основной свет, затем включаем его ночной режим.
+          - conditions:
+              - condition: state
+                entity_id: !input main_lights
+                state: "off"
+              - condition: state
+                entity_id: !input night_lights
+                state: "on"
+              - condition: template
+                value_template: "{{ not night_mode_active }}"
+            sequence:
               - action: light.turn_on
                 target:
                   entity_id: !input main_lights
-
-      # Включён только ночной свет: включаем обе группы, сохраняя яркость.
-      - conditions:
-          - condition: state
-            entity_id: !input main_lights
-            state: "off"
-          - condition: state
-            entity_id: !input night_lights
-            state: "on"
-        sequence:
-          # Выбор ветки уже выполнен: изменение режима не влияет на её условия.
-          - if:
-              - condition: template
-                value_template: "{{ night_mode_switches | length > 0 }}"
-            then:
               - if:
-                  - condition: time
-                    after: !input night_start
-                    before: !input night_end
+                  - condition: template
+                    value_template: "{{ night_mode_switches | length > 0 }}"
                 then:
                   - action: switch.turn_on
                     target:
                       entity_id: !input night_mode_switches
-                else:
-                  - action: switch.turn_off
-                    target:
-                      entity_id: !input night_mode_switches
-          - action: light.turn_on
-            target:
-              entity_id: !input night_lights
-          - action: light.turn_on
+
+        # Шаг 3 или смешанное состояние: сбрасываем режим и выключаем всё.
+        # После смены режима повторно выключаем свет, чтобы он остался выключен.
+        default:
+          - if:
+              - condition: template
+                value_template: "{{ night_mode_switches | length > 0 }}"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: !input night_mode_switches
+          - action: light.turn_off
             target:
               entity_id: !input main_lights
+          - action: light.turn_off
+            target:
+              entity_id: !input night_lights
 
-      # Включён только основной свет: добавляем приглушённый ночной свет.
-      - conditions:
-          - condition: state
-            entity_id: !input main_lights
-            state: "on"
-          - condition: state
-            entity_id: !input night_lights
-            state: "off"
-        sequence:
-          # Выбор ветки уже выполнен: изменение режима не влияет на её условия.
+    else:
+      # Днём только два состояния: обычный свет включён или всё выключено.
+      # Проверяем состояние до смены режима, которая может изменить сущности света.
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: !input main_lights
+                state: "off"
+              - condition: state
+                entity_id: !input night_lights
+                state: "off"
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ night_mode_switches | length > 0 }}"
+                then:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: !input night_mode_switches
+              - action: light.turn_on
+                target:
+                  entity_id: !input main_lights
+              - action: light.turn_on
+                target:
+                  entity_id: !input night_lights
+        default:
           - if:
               - condition: template
                 value_template: "{{ night_mode_switches | length > 0 }}"
             then:
-              - if:
-                  - condition: time
-                    after: !input night_start
-                    before: !input night_end
-                then:
-                  - action: switch.turn_on
-                    target:
-                      entity_id: !input night_mode_switches
-                else:
-                  - action: switch.turn_off
-                    target:
-                      entity_id: !input night_mode_switches
-          - action: light.turn_on
+              - action: switch.turn_off
+                target:
+                  entity_id: !input night_mode_switches
+          - action: light.turn_off
+            target:
+              entity_id: !input main_lights
+          - action: light.turn_off
             target:
               entity_id: !input night_lights
-            data:
-              brightness_pct: !input night_brightness_pct
-              flash: !input night_flash
-
-    # Обе группы включены или имеют смешанное состояние: выключаем всё.
-    default:
-      - action: light.turn_off
-        target:
-          entity_id: !input main_lights
-      - action: light.turn_off
-        target:
-          entity_id: !input night_lights

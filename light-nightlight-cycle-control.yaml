@@ -8,6 +8,9 @@ blueprint:
     enable Yeelight night mode using the selected switches; turn everything
     off and reset the mode switches.
 
+    Nightlights turn on steadily by default. A flash can be enabled separately
+    if the selected lights support it.
+
     Outside the nighttime interval, toggle both lighting groups on or off
     in normal mode, without the intermediate nightlight step or a flash.
 
@@ -98,10 +101,20 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
+    enable_night_flash:
+      name: "Использовать вспышку при первом включении"
+      description: >-
+        Optional. Request a flash during the first nighttime step.
+        Disabled by default so the nightlights turn on steadily without
+        a temporary flash effect. Existing automations also default to disabled.
+      default: false
+      selector:
+        boolean: {}
+
     night_flash:
       name: "Вспышка при включении ночного освещения"
       description: >-
-        The flash duration for the first nighttime step.
+        The flash duration when the optional flash is enabled.
         The lights must support this feature. No flash is requested during
         daytime operation or when adding the main lights.
       default: long
@@ -118,6 +131,7 @@ mode: single
 
 variables:
   night_mode_switches: !input night_mode_switches
+  enable_night_flash: !input enable_night_flash
   night_mode_active: >-
     {{ night_mode_switches | select('is_state', 'on') | list | count > 0 }}
 
@@ -143,12 +157,22 @@ actions:
               - condition: template
                 value_template: "{{ not night_mode_active }}"
             sequence:
-              - action: light.turn_on
-                target:
-                  entity_id: !input night_lights
-                data:
-                  brightness_pct: !input night_brightness_pct
-                  flash: !input night_flash
+              - if:
+                  - condition: template
+                    value_template: "{{ enable_night_flash }}"
+                then:
+                  - action: light.turn_on
+                    target:
+                      entity_id: !input night_lights
+                    data:
+                      brightness_pct: !input night_brightness_pct
+                      flash: !input night_flash
+                else:
+                  - action: light.turn_on
+                    target:
+                      entity_id: !input night_lights
+                    data:
+                      brightness_pct: !input night_brightness_pct
 
           # Шаг 2: добавляем основной свет, затем включаем его ночной режим.
           - conditions:

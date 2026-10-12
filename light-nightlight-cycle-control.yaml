@@ -4,8 +4,8 @@ blueprint:
     Control main lights and nightlights with a single button.
 
     During the nighttime interval, cycle through three steps: turn on only
-    the nightlights at the configured brightness; add the main lights and
-    enable Yeelight night mode using the selected switches; turn everything
+    the nightlights at the configured brightness; turn on the main lights
+    directly in Yeelight night mode using the selected switches; turn everything
     off without changing the mode switches.
 
     Nightlights turn on steadily by default. A flash can be enabled separately
@@ -56,12 +56,14 @@ blueprint:
       name: "Групповой переключатель ночного режима Yeelight"
       description: >-
         Optional. Select your existing group switch for Yeelight night mode,
-        or individual mode switches. Turning the switch on must enable night
-        mode; turning it off must restore normal mode. The switches are
-        enabled after the main lights are added in the second nighttime step
-        and disabled only when turning the lights on in normal daytime mode.
+        or individual mode switches. Turning the switch on must turn on the
+        main lights directly in night mode; turning it off must restore normal
+        mode. The second nighttime step turns on only these switches, without
+        first turning on the main lights in normal mode. The switches are
+        disabled only when turning the lights on in normal daytime mode.
         Turning the lights off preserves the current mode switch state.
-        Leave empty to cycle the lights without changing Yeelight mode.
+        Leave empty to turn on the main lights directly without changing
+        Yeelight mode in the second nighttime step.
       default: []
       selector:
         entity:
@@ -183,7 +185,7 @@ actions:
                     data:
                       brightness_pct: !input night_brightness_pct
 
-          # Шаг 2: добавляем основной свет, затем включаем его ночной режим.
+          # Шаг 2: переключатель сам включает основной свет в ночном режиме.
           - conditions:
               - condition: template
                 value_template: "{{ main_lights_off }}"
@@ -191,9 +193,6 @@ actions:
                 entity_id: !input night_lights
                 state: "on"
             sequence:
-              - action: light.turn_on
-                target:
-                  entity_id: !input main_lights
               - if:
                   - condition: template
                     value_template: "{{ night_mode_switches | length > 0 }}"
@@ -201,6 +200,10 @@ actions:
                   - action: switch.turn_on
                     target:
                       entity_id: !input night_mode_switches
+                else:
+                  - action: light.turn_on
+                    target:
+                      entity_id: !input main_lights
 
         # Шаг 3 или смешанное состояние: выключаем всё, сохраняя режим.
         default:

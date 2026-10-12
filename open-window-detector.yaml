@@ -6,13 +6,25 @@ blueprint:
 
     Поддерживает два режима восстановления состояния —
     "снапшот" (текущее состояние climate-устройств фиксируется в момент
-    срабатывания датчика на открытие, до выполнения любых действий,
+    срабатывания датчика на открытие, перед выключением устройства,
+    для каждого доступного устройства отдельно
     и сохраняется до успешного выполнения восстановления) и "фиксированное состояние"
     (при закрытии устройства переводятся в заданный пользователем набор
     действий, а не в то состояние, которое было до выключения).
 
     Поддерживается:
       - произвольный список climate-устройств для управления;
+      - независимое выключение и восстановление устройств: ошибка одного
+        устройства не мешает остальным;
+      - пропуск недоступных устройств при сохранении состояния;
+      - повтор восстановления оставшихся снимков раз в минуту, пока окно
+        закрыто; при ошибке снимок не удаляется.
+
+    Снимки временные: перезапуск Home Assistant или перезагрузка сцен
+    удаляет их. Устройство, недоступное при открытии окна, не имеет снимка
+    и не восстанавливается автоматически.
+
+    Также поддерживаются:
       - защита от дребезга датчика (anti-flapping) — задержка перед
         реакцией на изменение состояния;
       - дополнительные пользовательские действия, выполняемые после
@@ -48,6 +60,8 @@ blueprint:
         фиксируется в момент срабатывания на открытие, до выполнения
         каких-либо действий. Повторное открытие до восстановления не
         перезаписывает сохранённое состояние уже выключенных устройств.
+        Недоступные устройства пропускаются. Ошибки восстановления
+        изолированы; оставшиеся снимки повторяются раз в минуту при закрытом окне.
         Фиксированное состояние — при закрытии выполняются заданные
         вами действия (ниже), а не восстановление предыдущего состояния.
       default: snapshot
@@ -93,7 +107,10 @@ blueprint:
 
     actions_after_on:
       name: Действия после включения
-      description: Дополнительные действия, выполняемые сразу после восстановления климата.
+      description: >
+        Дополнительные действия после попытки восстановления при закрытии окна,
+        в том числе при частичном восстановлении. При ежеминутных повторных
+        попытках эти действия не выполняются.
       default: []
       selector:
         action: {}
@@ -121,8 +138,37 @@ trigger:
     for:
       seconds: !input flapping_delay
     id: closed
+  - platform: time_pattern
+    minutes: "/1"
+    id: retry_restore
 
-condition: []
+# Повторяем только незавершённое восстановление при стабильно закрытом окне.
+condition:
+  - condition: or
+    conditions:
+      - condition: trigger
+        id:
+          - opened
+          - closed
+      - condition: and
+        conditions:
+          - condition: template
+            value_template: "{{ restore_mode == 'snapshot' }}"
+          - condition: state
+            entity_id: !input trigger_sensor
+            state: "off"
+            for:
+              seconds: !input flapping_delay
+          - condition: template
+            value_template: >-
+              {% set ns = namespace(pending=false) %}
+              {% for scene in states.scene %}
+                {% if scene.entity_id == 'scene.' ~ scene_object_id
+                   or scene.entity_id.startswith('scene.' ~ scene_object_id ~ '_climate_') %}
+                  {% set ns.pending = true %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.pending }}
 
 action:
   - choose:
@@ -131,46 +177,104 @@ action:
           - condition: trigger
             id: opened
         sequence:
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: >-
-                      {{ restore_mode == 'snapshot' and
-                         states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count == 0 }}
-                sequence:
-                  - service: scene.create
-                    data:
-                      scene_id: "{{ scene_object_id }}"
-                      snapshot_entities: "{{ climate_entities }}"
-          - service: climate.turn_off
-            target:
-              entity_id: "{{ climate_entities }}"
+          - condition: state
+            entity_id: !input trigger_sensor
+            state: "on"
+          - repeat:
+              for_each: "{{ climate_entities }}"
+              sequence:
+                - variables:
+                    device_scene_id: "{{ scene_object_id ~ '_' ~ (repeat.item | replace('.', '_')) }}"
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ states(repeat.item) not in ['unknown', 'unavailable'] }}
+                  then:
+                    # Изолируем ошибку сохранения вместе с выключением: если
+                    # снимок не создан, это устройство оставляем включённым.
+                    - choose: []
+                      continue_on_error: true
+                      default:
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ restore_mode == 'snapshot' and
+                                   states.scene | selectattr('entity_id', 'eq', 'scene.' ~ device_scene_id) | list | count == 0 and
+                                   states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count == 0 }}
+                          then:
+                            - service: scene.create
+                              data:
+                                scene_id: "{{ device_scene_id }}"
+                                snapshot_entities: "{{ [repeat.item] }}"
+                        - service: climate.turn_off
+                          target:
+                            entity_id: "{{ repeat.item }}"
           - choose: []
             default: !input actions_after_off
 
-      # --- Триггер "закрыто" ---
+      # --- Закрытие окна или повтор незавершённого восстановления ---
       - conditions:
           - condition: trigger
-            id: closed
+            id:
+              - closed
+              - retry_restore
         sequence:
+          # В очереди окно могло снова открыться: не восстанавливаем климат.
+          - condition: state
+            entity_id: !input trigger_sensor
+            state: "off"
           - choose:
               - conditions:
                   - condition: template
-                    value_template: >
-                      {{ restore_mode == 'snapshot' and
-                         states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count > 0 }}
+                    value_template: "{{ restore_mode == 'snapshot' }}"
                 sequence:
-                  - service: scene.turn_on
-                    target:
-                      entity_id: "scene.{{ scene_object_id }}"
-                  # Удаляем снимок только после выполнения восстановления.
-                  # Следующее открытие сохранит актуальное состояние устройств.
-                  - service: scene.delete
-                    target:
-                      entity_id: "scene.{{ scene_object_id }}"
+                  - repeat:
+                      for_each: "{{ climate_entities }}"
+                      sequence:
+                        - variables:
+                            device_scene_id: "{{ scene_object_id ~ '_' ~ (repeat.item | replace('.', '_')) }}"
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ states(repeat.item) not in ['unknown', 'unavailable'] and
+                                   states.scene | selectattr('entity_id', 'eq', 'scene.' ~ device_scene_id) | list | count > 0 }}
+                          then:
+                            # Ошибка прерывает только этот блок: scene.delete
+                            # не выполняется, а цикл переходит к следующему устройству.
+                            - choose: []
+                              continue_on_error: true
+                              default:
+                                - service: scene.turn_on
+                                  target:
+                                    entity_id: "scene.{{ device_scene_id }}"
+                                - service: scene.delete
+                                  target:
+                                    entity_id: "scene.{{ device_scene_id }}"
+                  # Совместимость с общим снимком, созданным старой версией.
+                  # Его нельзя разделить: повторяем целиком и сохраняем при ошибке.
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ states.scene | selectattr('entity_id', 'eq', 'scene.' ~ scene_object_id) | list | count > 0 }}
+                    then:
+                      - choose: []
+                        continue_on_error: true
+                        default:
+                          - service: scene.turn_on
+                            target:
+                              entity_id: "scene.{{ scene_object_id }}"
+                          - service: scene.delete
+                            target:
+                              entity_id: "scene.{{ scene_object_id }}"
               - conditions:
                   - condition: template
                     value_template: "{{ restore_mode == 'fixed' }}"
                 sequence: !input fixed_state_action
-          - choose: []
-            default: !input actions_after_on
+          # Пользовательские действия выполняются только на закрытие окна,
+          # а не на каждый повтор восстановления отдельного устройства.
+          - if:
+              - condition: trigger
+                id: closed
+            then:
+              - choose: []
+                default: !input actions_after_on

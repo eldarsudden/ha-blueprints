@@ -242,7 +242,9 @@ actions:
       - condition: template
         value_template: >-
           {{ pause_adaptive_lighting and
-             has_service('adaptive_lighting', 'set_manual_control') }}
+             expand(integration_entities('adaptive_lighting'))
+             | rejectattr('state', 'in', ['unknown', 'unavailable'])
+             | list | count > 0 }}
     then:
       - variables:
           adaptive_lighting_lights: >-

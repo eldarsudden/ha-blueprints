@@ -19,6 +19,12 @@ blueprint:
     Из найденных nightlight-сущностей в первую очередь учитываются только
     те, чья основная лампа сейчас включена; если включённых ламп нет —
     учитываются все.
+
+    Опционально приостанавливает Adaptive Lighting для ламп Yeelight
+    выбранной области после любого переключения режима. Используется
+    ручное управление (manual_control): адаптация возобновляется после
+    выключения и повторного включения лампы. Для паузы без таймера
+    установите autoreset_control_seconds: 0 в Adaptive Lighting.
   domain: automation
   source_url: https://community.home-assistant.io/
 
@@ -89,6 +95,25 @@ blueprint:
                   value: normal
               mode: dropdown
 
+    adaptive_lighting_section:
+      name: "Adaptive Lighting"
+      icon: mdi:theme-light-dark
+      collapsed: true
+      input:
+        pause_adaptive_lighting:
+          name: "Приостановить адаптацию до следующего включения"
+          description: >
+            После переключения в Nightlight или обычный режим временно
+            приостанавливает Adaptive Lighting для ламп Yeelight выбранной
+            области. Устройства и управляющие ими настройки Adaptive Lighting
+            определяются автоматически, выбирать переключатели не нужно.
+            Адаптация возобновляется после выключения и повторного включения
+            лампы. Для паузы без таймера установите autoreset_control_seconds: 0
+            в Adaptive Lighting. По умолчанию опция выключена.
+          default: false
+          selector:
+            boolean: {}
+
     actions_section:
       name: "Дополнительные Actions"
       icon: mdi:script-text
@@ -123,6 +148,7 @@ actions:
       desync_priority: !input desync_priority
       nightlight_mode_extra_actions: !input nightlight_mode_extra_actions
       normal_extra_actions: !input normal_extra_actions
+      pause_adaptive_lighting: !input pause_adaptive_lighting
 
   # "Основные" light-сущности в области (виртуальные *_nightlight
   # исключены — это индикаторы/переключатели режима, а не сами лампы).
@@ -208,6 +234,38 @@ actions:
       area_id: !input target_area
     data:
       mode: "{{ 'moonlight' if target_nightlight_mode else 'normal' }}"
+
+  # Помечаем обе light-сущности Yeelight (обычную и nightlight), если
+  # они есть в области. Состояние основной сущности при смене режима
+  # может стать off, поэтому ручное управление задаём после set_mode.
+  - if:
+      - condition: template
+        value_template: >-
+          {{ pause_adaptive_lighting and
+             has_service('adaptive_lighting', 'set_manual_control') }}
+    then:
+      - variables:
+          adaptive_lighting_lights: >-
+            {{ area_entities(selected_area)
+               | select('in', integration_entities('yeelight'))
+               | select('match', '^light\.')
+               | list }}
+      - if:
+          - condition: template
+            value_template: "{{ adaptive_lighting_lights | count > 0 }}"
+        then:
+          # Без entity_id интеграция сама находит управляющий профиль.
+          # По одной лампе: в области могут быть разные профили адаптации.
+          - repeat:
+              for_each: "{{ adaptive_lighting_lights }}"
+              sequence:
+                - action: adaptive_lighting.set_manual_control
+                  # Лампа может не входить в Adaptive Lighting: её ошибка
+                  # не мешает обработке остальных и дополнительным действиям.
+                  continue_on_error: true
+                  data:
+                    lights: "{{ [repeat.item] }}"
+                    manual_control: true
 
   - choose:
       - conditions:

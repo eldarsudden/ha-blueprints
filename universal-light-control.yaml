@@ -1,5 +1,5 @@
 blueprint:
-  name: "Light / Nightlight Controller v5"
+  name: "Light Controller v5"
   description: >
     Универсальное управление светильниками с учетом Nightlight (в т.ч.
     Yeelight, но не только). Для каждого выбранного обычного light.*
@@ -16,6 +16,11 @@ blueprint:
     Для Toggle доступен режим синхронизации состояний (majority /
     any_off_on / any_on_off / individual) — решает проблему
     рассинхронизации при групповом переключении.
+
+    При Transition = 0 параметр transition не передаётся: используются
+    настройки интеграции, как при обычном переключении сущности.
+    Это позволяет группам Zigbee2MQTT использовать обычные команды
+    включения/выключения без принудительного управления уровнем яркости.
   domain: automation
 
   input:
@@ -91,6 +96,9 @@ blueprint:
 
         transition:
           name: "Transition"
+          description: >
+            0 = не передавать transition, использовать настройки интеграции.
+            Значение больше 0 задаёт длительность перехода в секундах.
           default: 0
           selector:
             number:
@@ -294,6 +302,16 @@ actions:
 
   # Единственный блок управления лампами: один список entity_id,
   # один вызов сервиса на операцию.
+  # Даже transition: 0 в Z2M считается явно заданным переходом и может
+  # заменить обычную команду on/off на управление уровнем яркости.
+  - variables:
+      light_action_data: >-
+        {{ dict(transition=selected_transition | float)
+           if selected_transition | float > 0 else {} }}
+      light_on_action_data: >-
+        {{ dict(light_action_data, brightness_pct=selected_brightness | int)
+           if selected_brightness | int > 0 else light_action_data }}
+
   - if:
       - condition: template
         value_template: "{{ total_count > 0 }}"
@@ -303,26 +321,10 @@ actions:
               - condition: template
                 value_template: "{{ effective_operation == 'on' }}"
             sequence:
-              - choose:
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ selected_brightness | int > 0 }}"
-                    sequence:
-                      - action: light.turn_on
-                        target:
-                          entity_id: "{{ control_entities }}"
-                        data:
-                          brightness_pct: "{{ selected_brightness | int }}"
-                          transition: "{{ selected_transition | float }}"
-                  - conditions:
-                      - condition: template
-                        value_template: "{{ selected_brightness | int == 0 }}"
-                    sequence:
-                      - action: light.turn_on
-                        target:
-                          entity_id: "{{ control_entities }}"
-                        data:
-                          transition: "{{ selected_transition | float }}"
+              - action: light.turn_on
+                target:
+                  entity_id: "{{ control_entities }}"
+                data: "{{ light_on_action_data }}"
 
           - conditions:
               - condition: template
@@ -331,8 +333,7 @@ actions:
               - action: light.turn_off
                 target:
                   entity_id: "{{ control_entities }}"
-                data:
-                  transition: "{{ selected_transition | float }}"
+                data: "{{ light_action_data }}"
 
           - conditions:
               - condition: template
@@ -341,8 +342,7 @@ actions:
               - action: light.toggle
                 target:
                   entity_id: "{{ control_entities }}"
-                data:
-                  transition: "{{ selected_transition | float }}"
+                data: "{{ light_action_data }}"
 
   # after_* хуки — тоже привязаны к исходной операции, выполняются
   # последовательно (как в предыдущей версии).

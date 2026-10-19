@@ -1,30 +1,25 @@
 blueprint:
-  name: "Yeelight — Nightlight Mode Toggle v2"
+  name: "Nightlight Mode Toggle v3"
   description: >
-    По триггеру переключает режим (yeelight.set_mode) у ламп Yeelight в
-    заданной Area между обычным режимом и Nightlight: один и тот же
-    триггер попеременно включает Nightlight всем лампам и возвращает их
-    обратно в обычный режим.
+    По триггеру переключает ночной и обычный режимы. Сущности состояния
+    с on означают ночной режим, с off — обычный. Для каждого режима
+    выполняется свой набор действий, в том числе для групп Zigbee2MQTT.
+    Действия должны обновлять выбранные сущности состояния, чтобы
+    следующее нажатие переключало режим обратно.
 
-    Текущий режим определяется по виртуальным nightlight-сущностям.
-    В зависимости от настройки nightlight_switch_type у интеграции
-    Yeelight это может быть light.*_nightlight (nightlight_switch_type:
-    light) ИЛИ switch.*_nightlight (nightlight_switch_type: switch) —
-    v2 распознаёт оба варианта автоматически, без ручной настройки.
+    Для устройств без Yeelight выключите опцию «Переключать режим Yeelight»,
+    укажите сущности состояния и действия для обоих режимов. Область
+    не требуется. Если сущности состояния не заданы, действия не выполняются.
 
-    Можно не указывать nightlight-сущности явно — блюпринт сам найдёт их
-    по устройствам ламп в выбранной области, либо задать конкретные
-    сущности вручную.
+    Опция Yeelight по умолчанию включена для совместимости: вызывает
+    yeelight.set_mode для выбранной области. Если сущности состояния
+    не заданы, автоматически находит light.*_nightlight и switch.*_nightlight
+    у устройств Yeelight. В этом режиме приоритет имеют сущности, чьи
+    основные лампы включены; если включённых ламп нет — учитываются все.
 
-    Из найденных nightlight-сущностей в первую очередь учитываются только
-    те, чья основная лампа сейчас включена; если включённых ламп нет —
-    учитываются все.
-
-    Опционально приостанавливает Adaptive Lighting для ламп Yeelight
-    выбранной области после любого переключения режима. Используется
-    ручное управление (manual_control): адаптация возобновляется после
-    выключения и повторного включения лампы. Для паузы без таймера
-    установите autoreset_control_seconds: 0 в Adaptive Lighting.
+    Только в режиме Yeelight можно дополнительно приостановить Adaptive
+    Lighting до выключения и повторного включения лампы. Для паузы без
+    таймера установите autoreset_control_seconds: 0 в Adaptive Lighting.
   domain: automation
   source_url: https://community.home-assistant.io/
 
@@ -43,14 +38,27 @@ blueprint:
             trigger: {}
 
     target_section:
-      name: "Целевая область"
+      name: "Yeelight (опционально)"
       icon: mdi:lightbulb-multiple
       collapsed: false
       input:
+        enable_yeelight:
+          name: "Переключать режим Yeelight"
+          description: >
+            Вызывает yeelight.set_mode для выбранной области. Отключите
+            для других устройств, включая группы Zigbee2MQTT: будут
+            выполняться только выбранные действия для каждого режима.
+            По умолчанию включено для совместимости с существующими автоматизациями.
+          default: true
+          selector:
+            boolean: {}
+
         target_area:
           name: "Область (Area) с лампами Yeelight"
           description: >
+            Требуется только при включённой опции Yeelight.
             Лампы Yeelight, для которых будет вызываться yeelight.set_mode.
+          default: ""
           selector:
             area:
               entity:
@@ -63,27 +71,24 @@ blueprint:
       collapsed: false
       input:
         nightlight_entities:
-          name: "Nightlight-сущности (опционально)"
+          name: "Сущности состояния ночного режима"
           description: >
-            Если оставить пустым — блюпринт сам найдёт light.*_nightlight
-            и switch.*_nightlight у устройств ламп в выбранной области.
-            Если указать вручную — используются именно эти сущности
-            (без автопоиска по устройствам).
+            on — ночной режим, off — обычный. Можно выбрать сущности любой
+            интеграции: light, switch, input_boolean и другие с состояниями
+            on/off, включая группы Z2M. В общем режиме обязательны.
+            Выбранные действия должны менять их состояние.
+            Если включена опция Yeelight, можно оставить пустым для
+            автопоиска light.*_nightlight и switch.*_nightlight в области.
           default: []
           selector:
             entity:
               multiple: true
-              filter:
-                - integration: yeelight
-                  domain: light
-                - integration: yeelight
-                  domain: switch
 
         desync_priority:
           name: "Приоритет при рассинхронизации"
           description: >
-            Применяется только когда часть проверяемых ламп в Nightlight,
-            а часть — в обычном режиме (когда все лампы уже
+            Применяется только когда часть проверяемых сущностей в Nightlight,
+            а часть — в обычном режиме (когда все сущности уже
             синхронизированы, блюпринт всегда работает как обычный toggle).
           default: nightlight
           selector:
@@ -103,6 +108,7 @@ blueprint:
         pause_adaptive_lighting:
           name: "Приостановить адаптацию до следующего включения"
           description: >
+            Применяется только при включённой опции Yeelight.
             После переключения в Nightlight или обычный режим временно
             приостанавливает Adaptive Lighting для ламп Yeelight выбранной
             области. Устройства и управляющие ими настройки Adaptive Lighting
@@ -115,20 +121,24 @@ blueprint:
             boolean: {}
 
     actions_section:
-      name: "Дополнительные Actions"
+      name: "Действия для режимов"
       icon: mdi:script-text
       collapsed: false
       input:
         nightlight_mode_extra_actions:
-          name: "Действия после перехода в Nightlight"
-          description: Выполняются сразу после yeelight.set_mode в Nightlight.
+          name: "Действия для ночного режима"
+          description: >
+            В общем режиме выполняются сразу после определения целевого режима.
+            С опцией Yeelight — после yeelight.set_mode и паузы Adaptive Lighting.
           default: []
           selector:
             action: {}
 
         normal_extra_actions:
-          name: "Действия после возврата в обычный режим"
-          description: Выполняются сразу после yeelight.set_mode в обычный режим.
+          name: "Действия для обычного режима"
+          description: >
+            В общем режиме выполняются сразу после определения целевого режима.
+            С опцией Yeelight — после yeelight.set_mode и паузы Adaptive Lighting.
           default: []
           selector:
             action: {}
@@ -143,6 +153,7 @@ actions:
   # "{{ (nightlight_mode_extra_actions | count) > 0 }}" ниже видел бы
   # undefined и условие всегда было бы false).
   - variables:
+      enable_yeelight: !input enable_yeelight
       selected_area: !input target_area
       nightlight_override: !input nightlight_entities
       desync_priority: !input desync_priority
@@ -154,7 +165,8 @@ actions:
   # исключены — это индикаторы/переключатели режима, а не сами лампы).
   - variables:
       area_lights: >-
-        {{ area_entities(selected_area)
+        {{ (area_entities(selected_area) if enable_yeelight and selected_area else [])
+           | select('in', integration_entities('yeelight') if enable_yeelight else [])
            | select('match', '^light\.')
            | reject('match', '^light\..*nightlight')
            | list }}
@@ -181,12 +193,13 @@ actions:
           {{ ns.list | unique | list }}
         {% endif %}
 
-  # Из nightlight_targets оставляем только те, чья основная лампа (того же
-  # устройства, не *_nightlight) сейчас включена.
+  # Только для Yeelight оставляем сущности с включённой основной лампой.
+  # Для других интеграций используем выбранные сущности напрямую:
+  # у группы Z2M или input_boolean может не быть основного light-устройства.
   - variables:
       targets_with_on_light: >-
         {% set ns = namespace(list=[]) %}
-        {% for nl in nightlight_targets %}
+        {% for nl in (nightlight_targets if enable_yeelight else []) %}
           {% set dev_id = device_id(nl) %}
           {% set dev_lights = (device_entities(dev_id) if dev_id else [])
              | select('match', '^light\.')
@@ -209,6 +222,14 @@ actions:
       nightlight_on_count: >-
         {{ ref_nightlight_targets | select('is_state', 'on') | list | count }}
 
+  # В общем режиме без сущностей невозможно определить, какую ветку запускать.
+  # Для Yeelight область обязательна: пустая цель не должна попасть в сервис.
+  - condition: template
+    alias: "Проверить настройки выбранного режима управления"
+    value_template: >-
+      {{ (enable_yeelight and selected_area | length > 0)
+         or (not enable_yeelight and ref_total > 0) }}
+
   # Итоговое целевое состояние (true = включить Nightlight всем,
   # false = вернуть всех в обычный режим).
   #   ref_total == 0                   → normal (нет данных)
@@ -229,11 +250,15 @@ actions:
 
   # Один вызов сервиса на всю область — режим выбирается шаблоном,
   # вместо двух дублирующихся веток "moonlight"/"normal".
-  - action: yeelight.set_mode
-    target:
-      area_id: !input target_area
-    data:
-      mode: "{{ 'moonlight' if target_nightlight_mode else 'normal' }}"
+  - if:
+      - condition: template
+        value_template: "{{ enable_yeelight }}"
+    then:
+      - action: yeelight.set_mode
+        target:
+          area_id: "{{ selected_area }}"
+        data:
+          mode: "{{ 'moonlight' if target_nightlight_mode else 'normal' }}"
 
   # Помечаем обе light-сущности Yeelight (обычную и nightlight), если
   # они есть в области. Состояние основной сущности при смене режима
@@ -241,7 +266,7 @@ actions:
   - if:
       - condition: template
         value_template: >-
-          {{ pause_adaptive_lighting and
+          {{ enable_yeelight and pause_adaptive_lighting and
              expand(integration_entities('adaptive_lighting'))
              | rejectattr('state', 'in', ['unknown', 'unavailable'])
              | list | count > 0 }}

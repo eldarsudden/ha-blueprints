@@ -2,7 +2,8 @@ blueprint:
   name: Lock Auto-close with Passage Mode
   description: >
     Закрывает замок при закрытии двери, если текущее время не попадает
-    в интервал прохода (Passage Mode). Поддерживает задержку перед закрытием.
+    в интервал прохода (Passage Mode) в выбранные дни недели.
+    Поддерживает задержку перед закрытием.
     Также автоматически закрывает замок в момент окончания интервала
     прохода, если к этому моменту он остался открытым.
     Замок никогда не закрывается, пока дверь открыта.
@@ -49,12 +50,40 @@ blueprint:
       name: Passage Mode
       icon: mdi:door-open
       description: >
-        Интервал времени, в течение которого автозакрытие отключено.
+        Интервал времени и дни недели, в которые автозакрытие отключено.
         Необязательно — если оставить оба значения одинаковыми
         (по умолчанию 00:00:00), интервал не действует и замок
-        закрывается в любое время.
+        закрывается в любое время. Дни относятся к началу интервала:
+        понедельник 22:00–06:00 означает проход до вторника 06:00.
       collapsed: true
       input:
+        passage_weekdays:
+          name: Дни недели для режима прохода
+          description: >
+            Дни начала интервала прохода. По умолчанию — каждый день.
+            В остальные дни действует обычное автозакрытие.
+            Если не выбрать ни одного дня, режим прохода отключён.
+          default: [mon, tue, wed, thu, fri, sat, sun]
+          selector:
+            select:
+              multiple: true
+              mode: dropdown
+              options:
+                - label: Понедельник
+                  value: mon
+                - label: Вторник
+                  value: tue
+                - label: Среда
+                  value: wed
+                - label: Четверг
+                  value: thu
+                - label: Пятница
+                  value: fri
+                - label: Суббота
+                  value: sat
+                - label: Воскресенье
+                  value: sun
+
         passage_start_time:
           name: Начало интервала прохода
           description: Время, когда замок перестаёт автозакрываться.
@@ -78,6 +107,29 @@ max_exceeded: silent
 variables:
   passage_start: !input passage_start_time
   passage_end: !input passage_end_time
+  passage_days: !input passage_weekdays
+  # Для ночного интервала после полуночи проверяем день его начала.
+  passage_active: >-
+    {% set current = now() %}
+    {% set start = today_at(passage_start) %}
+    {% set end = today_at(passage_end) %}
+    {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+    {% if start > end %}
+      {% if current < end %}
+        {% set start = start - timedelta(days=1) %}
+      {% else %}
+        {% set end = end + timedelta(days=1) %}
+      {% endif %}
+    {% endif %}
+    {{ weekdays[start.weekday()] in passage_days and start <= current < end }}
+  # Триггер времени срабатывает каждый день; закрываем только в конце
+  # интервала, который начался в выбранный день недели.
+  passage_end_scheduled: >-
+    {% set start = today_at(passage_start) %}
+    {% set end = today_at(passage_end) %}
+    {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+    {% set start_day = (now().weekday() - (1 if start > end else 0)) % 7 %}
+    {{ start != end and weekdays[start_day] in passage_days }}
 
 triggers:
   - trigger: state
@@ -100,16 +152,8 @@ actions:
       - conditions:
           - condition: trigger
             id: door_closed
-          - condition: or
-            conditions:
-              # интервал не задан (начало == конец) -> прохода нет
-              - condition: template
-                value_template: "{{ passage_start == passage_end }}"
-              - condition: not
-                conditions:
-                  - condition: time
-                    after: !input passage_start_time
-                    before: !input passage_end_time
+          - condition: template
+            value_template: "{{ not passage_active }}"
         sequence:
           - delay:
               seconds: !input lock_delay
@@ -126,9 +170,9 @@ actions:
       - conditions:
           - condition: trigger
             id: passage_end
-          # при выключенном интервале не срабатывать в 00:00
+          # Не закрывать по расписанию в дни без интервала прохода.
           - condition: template
-            value_template: "{{ passage_start != passage_end }}"
+            value_template: "{{ passage_end_scheduled }}"
           - condition: state
             entity_id: !input lock_entity
             state: "unlocked"
@@ -151,15 +195,8 @@ actions:
           - condition: state
             entity_id: !input door_sensor
             state: "off"
-          - condition: or
-            conditions:
-              - condition: template
-                value_template: "{{ passage_start == passage_end }}"
-              - condition: not
-                conditions:
-                  - condition: time
-                    after: !input passage_start_time
-                    before: !input passage_end_time
+          - condition: template
+            value_template: "{{ not passage_active }}"
         sequence:
           - action: lock.lock
             target:

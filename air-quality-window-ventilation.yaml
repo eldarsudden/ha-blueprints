@@ -1,0 +1,454 @@
+blueprint:
+  name: "Air Quality Window Ventilation"
+  description: >-
+    Открывает выбранные окна при повышении CO₂ или TVOC и закрывает,
+    когда все выбранные показатели снизились до порогов закрытия.
+    Отдельные пороги открытия и закрытия предотвращают частые переключения.
+
+    При снижении температуры комнаты до минимального значения окно
+    закрывается после настраиваемой задержки независимо от качества воздуха.
+    Прогрев выше минимального порога отменяет отсчёт. По умолчанию задержка
+    равна нулю. Закрытие после улучшения воздуха или потери показаний
+    выполняется без этой задержки. Повторное открытие
+    разрешается только после прогрева до отдельного порога.
+    Температура определяется по самому холодному датчику в выбранной Area
+    либо по датчикам, указанным вручную. Поддерживаются °C, °F и K;
+    температурные пороги задаются в °C.
+
+    Выберите хотя бы один датчик CO₂ или TVOC. CO₂ должен измеряться в ppm.
+    Пороги TVOC задаются в единицах выбранного датчика: ppb, µg/m³ или
+    других. Если датчиков TVOC несколько, единицы должны совпадать.
+    Значения порогов — начальные настройки, которые нужно подобрать
+    под датчики и желаемый режим проветривания.
+
+    При недоступности любого выбранного датчика или отсутствии пригодных
+    температурных датчиков окно закрывается; открытие блокируется до
+    восстановления показаний. Недоступные окна пропускаются.
+
+    Реагирует на изменение показаний и состояния окон, запуск HA и раз
+    в минуту повторяет проверку. Датчики температуры из Area также
+    отслеживаются при пересечении температурных порогов.
+    Управляет и окнами, открытыми вручную, пока автоматизация включена.
+    Перезапуск HA или перезагрузка автоматики сбрасывают отсчёт задержки.
+    Требуются cover-сущности с поддержкой открытия и закрытия.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+
+  input:
+    room_section:
+      name: "Комната и окна"
+      icon: mdi:window-open
+      collapsed: false
+      input:
+        room_area:
+          name: "Комната (Area)"
+          description: >-
+            Область для поиска комнатных датчиков температуры.
+            Окна выбираются отдельно: управление всей областью не выполняется.
+          selector:
+            area: {}
+        window_entities:
+          name: "Окна"
+          description: "Только выбранные cover-сущности будут открываться и закрываться."
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: cover
+
+    co2_section:
+      name: "CO₂"
+      icon: mdi:molecule-co2
+      collapsed: false
+      input:
+        co2_sensors:
+          name: "Датчики CO₂ (опционально)"
+          description: >-
+            Можно выбрать один или несколько датчиков в ppm.
+            Оставьте пустым, если используется только TVOC.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: sensor
+                  device_class: carbon_dioxide
+        co2_open_threshold:
+          name: "CO₂: открыть при значении не ниже"
+          default: 1200
+          selector:
+            number:
+              min: 0
+              max: 10000
+              step: 50
+              unit_of_measurement: ppm
+              mode: box
+        co2_close_threshold:
+          name: "CO₂: закрыть при значении не выше"
+          description: "Должен быть ниже порога открытия. Учитываются все выбранные датчики."
+          default: 800
+          selector:
+            number:
+              min: 0
+              max: 10000
+              step: 50
+              unit_of_measurement: ppm
+              mode: box
+
+    tvoc_section:
+      name: "TVOC"
+      icon: mdi:air-filter
+      collapsed: false
+      input:
+        tvoc_sensors:
+          name: "Датчики TVOC (опционально)"
+          description: >-
+            Пороги задаются в тех же единицах, что и показания датчика.
+            Не смешивайте ppb и µg/m³ в одном списке.
+            Оставьте пустым, если используется только CO₂.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: sensor
+        tvoc_open_threshold:
+          name: "TVOC: открыть при значении не ниже"
+          default: 500
+          selector:
+            number:
+              min: 0
+              max: 100000
+              step: 1
+              mode: box
+        tvoc_close_threshold:
+          name: "TVOC: закрыть при значении не выше"
+          description: "Должен быть ниже порога открытия. Учитываются все выбранные датчики."
+          default: 250
+          selector:
+            number:
+              min: 0
+              max: 100000
+              step: 1
+              mode: box
+
+    temperature_section:
+      name: "Температура комнаты"
+      icon: mdi:home-thermometer
+      collapsed: false
+      input:
+        temperature_sensors:
+          name: "Датчики температуры (опционально)"
+          description: >-
+            Если список пуст, используются sensor-сущности с device_class
+            temperature в выбранной Area. Из всех датчиков берётся самая
+            низкая температура. Можно выбрать конкретные комнатные датчики,
+            чтобы исключить неподходящие датчики из автоматического поиска.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: sensor
+                  device_class: temperature
+        temperature_close_threshold:
+          name: "Закрыть окно при температуре не выше"
+          default: 20
+          selector:
+            number:
+              min: 5
+              max: 35
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+        temperature_reopen_threshold:
+          name: "Разрешить открытие при температуре не ниже"
+          description: "Должен быть выше температурного порога закрытия."
+          default: 22
+          selector:
+            number:
+              min: 5
+              max: 40
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+        temperature_close_delay:
+          name: "Задержка закрытия при низкой температуре"
+          description: >-
+            Сколько минут комната должна оставаться холоднее или равной
+            порогу закрытия. После этого окно закроется даже при высоких
+            CO₂ и TVOC. Прогрев выше порога отменяет закрытие по холоду.
+            0 = закрыть сразу. Показания CO₂ и TVOC не сбрасывают отсчёт.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 60
+              step: 0.5
+              unit_of_measurement: "мин"
+              mode: box
+
+# Ожидание закрытия по холоду не блокирует остальные проверки, в частности
+# немедленное закрытие при потере показаний или улучшении качества воздуха.
+# Ниже ограничены события, которые могут запускать длительное ожидание.
+mode: parallel
+max: 50
+
+# В trigger_variables только inputs: поиск датчиков происходит в шаблонах,
+# чтобы их изменения отслеживались, а не фиксировались при загрузке.
+trigger_variables:
+  selected_area: !input room_area
+  selected_temperature_sensors: !input temperature_sensors
+  minimum_temperature: !input temperature_close_threshold
+  reopening_temperature: !input temperature_reopen_threshold
+
+triggers:
+  - trigger: state
+    entity_id: !input co2_sensors
+    id: co2_changed
+  - trigger: state
+    entity_id: !input tvoc_sensors
+    id: tvoc_changed
+  - trigger: state
+    entity_id: !input temperature_sensors
+    id: temperature_changed
+  - trigger: state
+    entity_id: !input window_entities
+    id: window_changed
+  # Автоматически найденные датчики нельзя подставить в статический state
+  # trigger. Шаблоны следят за холодом/потерей показаний и прогревом комнаты.
+  - trigger: template
+    id: room_cold_or_unavailable
+    value_template: >-
+      {% set ns = namespace(values=[], valid=true) %}
+      {% set sensors = selected_temperature_sensors %}
+      {% if sensors | count == 0 %}
+        {% set sensors = area_entities(selected_area)
+           | select('match', '^sensor[.]')
+           | select('is_state_attr', 'device_class', 'temperature') | list %}
+      {% endif %}
+      {% for entity in sensors %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+             else value - 273.15 if unit == 'K' else value %}
+          {% set ns.values = ns.values + [celsius | round(3)] %}
+        {% endif %}
+      {% endfor %}
+      {{ not ns.valid or ns.values | count == 0
+         or ns.values | min <= minimum_temperature | float }}
+  - trigger: template
+    id: room_warmed_up
+    value_template: >-
+      {% set ns = namespace(values=[], valid=true) %}
+      {% set sensors = selected_temperature_sensors %}
+      {% if sensors | count == 0 %}
+        {% set sensors = area_entities(selected_area)
+           | select('match', '^sensor[.]')
+           | select('is_state_attr', 'device_class', 'temperature') | list %}
+      {% endif %}
+      {% for entity in sensors %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+             else value - 273.15 if unit == 'K' else value %}
+          {% set ns.values = ns.values + [celsius | round(3)] %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.valid and ns.values | count > 0
+         and ns.values | min >= reopening_temperature | float }}
+  - trigger: homeassistant
+    event: start
+    id: startup
+  - trigger: time_pattern
+    minutes: "/1"
+    id: periodic_check
+
+conditions: []
+
+actions:
+  - variables:
+      selected_area: !input room_area
+      windows: !input window_entities
+      co2_entities: !input co2_sensors
+      tvoc_entities: !input tvoc_sensors
+      selected_temperature_sensors: !input temperature_sensors
+      co2_open: !input co2_open_threshold
+      co2_close: !input co2_close_threshold
+      tvoc_open: !input tvoc_open_threshold
+      tvoc_close: !input tvoc_close_threshold
+      minimum_temperature: !input temperature_close_threshold
+      reopening_temperature: !input temperature_reopen_threshold
+      cold_close_delay: !input temperature_close_delay
+
+  - condition: template
+    alias: "Выбраны датчики и заданы разные пороги открытия/закрытия"
+    value_template: >-
+      {{ windows | count > 0 and co2_entities | count + tvoc_entities | count > 0
+         and (co2_entities | count == 0 or co2_open | float > co2_close | float)
+         and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
+         and reopening_temperature | float > minimum_temperature | float }}
+
+  - &refresh_temperature_entities
+    variables:
+      temperature_entities: >-
+        {{ selected_temperature_sensors if selected_temperature_sensors | count > 0
+           else area_entities(selected_area)
+           | select('match', '^sensor[.]')
+           | select('is_state_attr', 'device_class', 'temperature') | list }}
+
+  - &refresh_readings
+    variables:
+      readings: >-
+        {% set ns = namespace(valid=true, high=false, recovered=true,
+           temperatures=[], tvoc_units=[]) %}
+        {% for entity in co2_entities + tvoc_entities %}
+          {% set value = states(entity) %}
+          {% set unit = state_attr(entity, 'unit_of_measurement') %}
+          {% if not is_number(value) %}
+            {% set ns.valid = false %}
+          {% elif value | float < 0 %}
+            {% set ns.valid = false %}
+          {% else %}
+            {% set value = value | float %}
+            {% if entity in co2_entities %}
+              {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+              {% set ns.high = ns.high or value >= co2_open | float %}
+              {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+            {% endif %}
+            {% if entity in tvoc_entities %}
+              {% set ns.tvoc_units = ns.tvoc_units + [unit] %}
+              {% set ns.high = ns.high or value >= tvoc_open | float %}
+              {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {% for entity in temperature_entities %}
+          {% set value = states(entity) %}
+          {% set unit = state_attr(entity, 'unit_of_measurement') %}
+          {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+            {% set ns.valid = false %}
+          {% else %}
+            {% set value = value | float %}
+            {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+               else value - 273.15 if unit == 'K' else value %}
+            {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
+          {% endif %}
+        {% endfor %}
+        {{ dict(valid=ns.valid and ns.temperatures | count > 0
+             and ns.tvoc_units | unique | list | count <= 1,
+           high=ns.high, recovered=ns.recovered,
+           temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
+
+  - variables:
+      window_action: >-
+        {% if not readings.valid %}
+          close
+        {% elif readings.recovered %}
+          close
+        {% elif readings.temperature <= minimum_temperature | float %}
+          {{ 'close_cold' if cold_close_delay | float > 0 else 'close' }}
+        {% elif readings.high and readings.temperature >= reopening_temperature | float %}
+          open
+        {% else %}
+          hold
+        {% endif %}
+
+  - if:
+      - condition: template
+        value_template: "{{ window_action == 'close_cold' }}"
+    then:
+      # Не создаём таймер на каждое обновление показаний. Первый отсчёт —
+      # при похолодании, запуске HA, ручном открытии окна или ручном запуске.
+      # Раз в 5 минут возможен повтор для восстановления после reload/ошибок;
+      # повтор не отменяет уже запущенный отсчёт.
+      - condition: template
+        value_template: >-
+          {{ trigger is not defined
+             or trigger.id | default('') in ['room_cold_or_unavailable', 'startup']
+             or (trigger.id | default('') == 'periodic_check' and now().minute % 5 == 0)
+             or (trigger.id | default('') == 'window_changed'
+                 and trigger.to_state is not none
+                 and trigger.to_state.state in ['open', 'opening']) }}
+      - condition: template
+        value_template: >-
+          {{ windows | select('is_state', 'open') | list | count > 0
+             or windows | select('is_state', 'opening') | list | count > 0 }}
+      - wait_template: >-
+          {% set ns = namespace(values=[], valid=true) %}
+          {% set sensors = selected_temperature_sensors %}
+          {% if sensors | count == 0 %}
+            {% set sensors = area_entities(selected_area)
+               | select('match', '^sensor[.]')
+               | select('is_state_attr', 'device_class', 'temperature') | list %}
+          {% endif %}
+          {% for entity in sensors %}
+            {% set value = states(entity) %}
+            {% set unit = state_attr(entity, 'unit_of_measurement') %}
+            {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+              {% set ns.valid = false %}
+            {% else %}
+              {% set value = value | float %}
+              {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+                 else value - 273.15 if unit == 'K' else value %}
+              {% set ns.values = ns.values + [celsius | round(3)] %}
+            {% endif %}
+          {% endfor %}
+          {{ not ns.valid or ns.values | count == 0
+             or ns.values | min > minimum_temperature | float }}
+        timeout:
+          minutes: "{{ cold_close_delay | float }}"
+        continue_on_timeout: true
+      # За время ожидания могли измениться показания и состав датчиков.
+      - *refresh_temperature_entities
+      - *refresh_readings
+      - condition: template
+        value_template: >-
+          {{ not readings.valid or readings.recovered
+             or (not wait.completed and readings.temperature <= minimum_temperature | float) }}
+      - variables:
+          window_action: close
+
+  # Только явный список cover; Area используется исключительно для датчиков.
+  # Не отправляем повторные команды уже открытым/закрытым/движущимся окнам.
+  - repeat:
+      for_each: "{{ windows | unique | list }}"
+      sequence:
+        # Другой запуск мог отреагировать на прогрев или потерю показаний,
+        # пока выполнялась команда предыдущему окну.
+        - *refresh_temperature_entities
+        - *refresh_readings
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {{ window_action == 'close'
+                       and (not readings.valid or readings.recovered
+                            or readings.temperature <= minimum_temperature | float)
+                       and states(repeat.item) in ['open', 'opening'] }}
+              sequence:
+                - action: cover.close_cover
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {{ window_action == 'open'
+                       and readings.valid and readings.high and not readings.recovered
+                       and readings.temperature >= reopening_temperature | float
+                       and states(repeat.item) in ['closed', 'closing'] }}
+              sequence:
+                - action: cover.open_cover
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"

@@ -13,8 +13,13 @@ blueprint:
     закрывается после настраиваемой задержки независимо от качества воздуха.
     Прогрев выше минимального порога отменяет отсчёт. По умолчанию задержка
     равна нулю. Закрытие после улучшения воздуха или потери показаний
-    выполняется без этой задержки. Повторное открытие
-    разрешается только после прогрева до отдельного порога.
+    выполняется без этой задержки. По умолчанию повторное открытие
+    разрешается только после прогрева до отдельного порога. Опция
+    проветривания при низкой температуре разрешает начать новое
+    проветривание по CO₂/TVOC без прогрева; после открытия защита
+    по холоду работает с прежним порогом и задержкой. Между такими
+    проветриваниями выдерживается настраиваемая пауза от перехода окна
+    в closed. После перезапуска HA отсчёт паузы может начаться заново.
     Температура определяется по самому холодному датчику в выбранной Area
     либо по датчикам, указанным вручную. Поддерживаются °C, °F и K;
     температурные пороги задаются в °C.
@@ -29,8 +34,8 @@ blueprint:
     температурных датчиков окно закрывается; открытие блокируется до
     восстановления показаний. Недоступные окна пропускаются.
     Защита по холоду и потере показаний всегда закрывает окно полностью.
-    Увеличение открытия, включая приоткрытие при нормальном воздухе,
-    разрешается только после прогрева до порога повторного открытия.
+    Увеличение открытия при нормальном воздухе по-прежнему разрешается
+    только после прогрева до порога повторного открытия.
 
     Реагирует на изменение показаний и состояния окон, запуск HA и раз
     в минуту повторяет проверку. Датчики температуры из Area также
@@ -212,6 +217,37 @@ blueprint:
               step: 0.5
               unit_of_measurement: "°C"
               mode: box
+        allow_cold_ventilation:
+          name: "Начинать проветривание даже при низкой температуре"
+          description: >-
+            Разрешает открыть окно при высоком CO₂/TVOC, даже если температура
+            ниже порога повторного открытия. После открытия проверка холода
+            и задержка полного закрытия работают как обычно. При нулевой
+            задержке холодное окно закроется сразу. Недоступные показания
+            по-прежнему запрещают открытие. Приоткрытие при нормальном
+            воздухе остаётся ограничено температурой. Новый цикл начинается
+            только у закрытого окна после паузы; выбранный контактный датчик
+            также должен подтверждать закрытие.
+          default: false
+          selector:
+            boolean: {}
+        cold_ventilation_pause:
+          name: "Пауза между проветриваниями при низкой температуре"
+          description: >-
+            Используется, если включена опция выше. Минимальное время
+            от перехода cover в состояние «закрыто» до нового открытия
+            при высоком CO₂/TVOC и температуре ниже порога повторного открытия.
+            Проверяется раз в минуту. При прогреве обычное проветривание
+            разрешено без этой паузы. После перезапуска HA отсчёт может
+            начаться заново.
+          default: 30
+          selector:
+            number:
+              min: 1
+              max: 1440
+              step: 1
+              unit_of_measurement: "мин"
+              mode: box
         temperature_close_delay:
           name: "Задержка закрытия при низкой температуре"
           description: >-
@@ -340,6 +376,7 @@ trigger_variables:
   selected_temperature_sensors: !input temperature_sensors
   minimum_temperature: !input temperature_close_threshold
   reopening_temperature: !input temperature_reopen_threshold
+  allow_cold_ventilation: !input allow_cold_ventilation
   co2_entities: !input co2_sensors
   tvoc_entities: !input tvoc_sensors
   co2_open: !input co2_open_threshold
@@ -484,7 +521,8 @@ triggers:
          and (not ns.valid or ns.temperatures | count == 0
               or ns.units | unique | list | count > 1
               or no_available_windows
-              or ns.temperatures | min < reopening_temperature | float) %}
+              or (not allow_cold_ventilation
+                  and ns.temperatures | min < reopening_temperature | float)) %}
       {{ blocked != (invert_blocked_check | default(false)) }}
   - trigger: time_pattern
     minutes: "/1"
@@ -507,6 +545,9 @@ actions:
       tvoc_close: !input tvoc_close_threshold
       minimum_temperature: !input temperature_close_threshold
       reopening_temperature: !input temperature_reopen_threshold
+      allow_cold_ventilation: !input allow_cold_ventilation
+      cold_ventilation_pause: !input cold_ventilation_pause
+      cold_ventilation_started: false
       cold_close_delay: !input temperature_close_delay
       normal_position: !input air_recovered_position
       contact_pairs: !input window_contacts
@@ -538,6 +579,7 @@ actions:
          and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
          and is_number(normal_position) and 0 <= normal_position | float <= 100
          and normal_position | float == normal_position | int
+         and is_number(cold_ventilation_pause) and 1 <= cold_ventilation_pause | float <= 1440
          and reopening_temperature | float > minimum_temperature | float }}
 
   - alias: "Сообщить об ошибке настроек"
@@ -671,14 +713,28 @@ actions:
           {% if windows | select('is_state', 'open') | list | count == 0
              and windows | select('is_state', 'opening') | list | count == 0
              and contacts.values() | select('is_state', 'on') | list | count == 0 %}
-            Открытие запрещено: в комнате холодно
+            {% if allow_cold_ventilation and readings.high %}
+              Пауза между проветриваниями: {{ cold_ventilation_pause }} мин после закрытия
+            {% else %}
+              Открытие запрещено: в комнате холодно
+            {% endif %}
           {% elif cold_close_delay | float > 0 %}
             Ожидание закрытия по холоду: {{ cold_close_delay }} мин
           {% else %}
             Закрытие: низкая температура
           {% endif %}
         {% elif readings.high and readings.temperature < reopening_temperature | float %}
-          Открытие запрещено: ожидание прогрева комнаты
+          {% if allow_cold_ventilation %}
+            {% if windows | select('is_state', 'open') | list | count > 0
+               or windows | select('is_state', 'opening') | list | count > 0
+               or contacts.values() | select('is_state', 'on') | list | count > 0 %}
+              Проветривание: CO₂/TVOC выше порога
+            {% else %}
+              Пауза между проветриваниями: {{ cold_ventilation_pause }} мин после закрытия
+            {% endif %}
+          {% else %}
+            Открытие запрещено: ожидание прогрева комнаты
+          {% endif %}
         {% elif readings.high %}
           {% if windows | select('is_state', 'closed') | list | count == 0
              and windows | select('is_state', 'closing') | list | count == 0
@@ -694,6 +750,50 @@ actions:
         {% endif %}
 
   - *publish_status
+
+  # Отдельный проход отправляет команды открытия до возможного ожидания
+  # закрытия по холоду. Повторные события окна и датчиков не обходят паузу.
+  # last_changed меняется при смене состояния, но не при смене атрибутов.
+  - alias: "Начать новое проветривание без ожидания прогрева"
+    choose:
+      - conditions:
+          - condition: template
+            alias: "Проветривание при низкой температуре разрешено и воздух требует его"
+            value_template: >-
+              {{ allow_cold_ventilation and readings.valid and readings.high
+                 and readings.temperature < reopening_temperature | float }}
+        sequence:
+          - repeat:
+              for_each: "{{ windows | unique | list }}"
+              sequence:
+                - variables:
+                    current_window: "{{ repeat.item }}"
+                    contact_sensor: "{{ contacts.get(repeat.item, '') }}"
+                - *refresh_temperature_entities
+                - *refresh_readings
+                - choose:
+                    - conditions:
+                        - condition: template
+                          alias: "Окно закрыто, пауза прошла и показания разрешают проветривание"
+                          value_template: >-
+                            {{ readings.valid and readings.high and not readings.recovered
+                               and readings.temperature < reopening_temperature | float
+                               and is_state(current_window, 'closed')
+                               and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
+                               and as_timestamp(now())
+                                   - as_timestamp(states[current_window].last_changed, as_timestamp(now()))
+                                   >= cold_ventilation_pause | float * 60 }}
+                      sequence:
+                        - action: cover.open_cover
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ current_window }}"
+                        - variables:
+                            cold_ventilation_started: true
+          - *refresh_temperature_entities
+          - *refresh_readings
+          - *refresh_decision
+          - *publish_status
 
   # Один монитор на начало блокировки; startup и пятиминутные проверки
   # восстанавливают отсчёт после reload, если условие уже было истинным.
@@ -773,6 +873,7 @@ actions:
             alias: "Событие разрешает запуск таймера закрытия по холоду"
             value_template: >-
               {{ trigger is not defined
+                 or cold_ventilation_started
                  or trigger.id | default('') in ['room_cold_or_unavailable', 'startup']
                  or (trigger.id | default('') == 'periodic_check' and now().minute % 5 == 0)
                  or (trigger.id | default('') == 'window_changed'

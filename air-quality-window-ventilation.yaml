@@ -31,6 +31,18 @@ blueprint:
     Управляет и окнами, открытыми вручную, пока автоматизация включена.
     Перезапуск HA или перезагрузка автоматики сбрасывают отсчёт задержки.
     Требуются cover-сущности с поддержкой открытия и закрытия.
+
+    Причина решения доступна в переменной ventilation_status трассировки.
+    Для вывода на панель можно выбрать текстовый помощник input_text.
+    При длительно высоком CO₂/TVOC и заблокированном открытии создаётся
+    уведомление в Home Assistant. Таймер уведомления сбрасывается при
+    перезапуске HA или перезагрузке автоматизации.
+
+    Дополнительно можно сопоставить окна с контактными binary_sensor:
+    off означает закрыто, on — открыто. Только для указанных пар после
+    команды закрытия проверяется контакт, выполняется ограниченное число
+    повторов за одну проверку и выводится уведомление при неудаче.
+    Новые события и периодические проверки могут повторять попытку закрытия.
   domain: automation
   homeassistant:
     min_version: 2024.10.0
@@ -189,6 +201,87 @@ blueprint:
               unit_of_measurement: "мин"
               mode: box
 
+    verification_section:
+      name: "Подтверждение закрытия (опционально)"
+      icon: mdi:window-closed-variant
+      collapsed: true
+      input:
+        window_contacts:
+          name: "Контактные датчики окон"
+          description: >-
+            Необязательное сопоставление cover → binary_sensor. Например:
+            {"cover.bedroom_window": "binary_sensor.bedroom_window_contact"}.
+            Укажите только окна из выбранного списка. Каждый датчик относится
+            к одному окну: off = закрыто, on = открыто. Пустой объект {}
+            отключает подтверждение закрытия и повторы команд.
+          default: {}
+          selector:
+            object: {}
+        close_confirmation_timeout:
+          name: "Ожидание подтверждения закрытия"
+          description: "Сколько ждать контактный датчик после каждой команды закрытия."
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 180
+              step: 1
+              unit_of_measurement: "сек"
+              mode: box
+        close_retry_count:
+          name: "Повторы команды закрытия"
+          description: >-
+            Число дополнительных команд за одну проверку после первоначальной.
+            0 = только дождаться датчика и сообщить о неудаче.
+            При недоступном контактном датчике дополнительные команды не отправляются.
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 5
+              step: 1
+              mode: box
+
+    diagnostics_section:
+      name: "Статус и уведомления"
+      icon: mdi:information-outline
+      collapsed: true
+      input:
+        status_entity:
+          name: "Текстовый помощник для статуса (опционально)"
+          description: >-
+            Создайте помощник «Текст» без ограничения шаблоном, с минимальной
+            длиной 0 и максимальной 255, и выберите его здесь. Причина решения
+            будет видна на панели. Без помощника она доступна в трассировке.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        enable_notifications:
+          name: "Уведомления о проблемах в Home Assistant"
+          description: >-
+            Сообщает о длительно плохом воздухе при заблокированном открытии
+            и о неподтверждённом закрытии. Для каждой проблемы обновляется
+            одно уведомление; после устранения оно удаляется.
+          default: true
+          selector:
+            boolean: {}
+        blocked_air_notification_delay:
+          name: "Плохой воздух при заблокированном открытии: уведомить через"
+          description: >-
+            CO₂ или TVOC должен всё это время оставаться высоким, все окна —
+            закрытыми или недоступными, а открытие — невозможным из-за
+            температуры, некорректных показаний или недоступности приводов.
+          default: 15
+          selector:
+            number:
+              min: 1
+              max: 120
+              step: 1
+              unit_of_measurement: "мин"
+              mode: box
+
 # Ожидание закрытия по холоду не блокирует остальные проверки, в частности
 # немедленное закрытие при потере показаний или улучшении качества воздуха.
 # Ниже ограничены события, которые могут запускать длительное ожидание.
@@ -202,6 +295,13 @@ trigger_variables:
   selected_temperature_sensors: !input temperature_sensors
   minimum_temperature: !input temperature_close_threshold
   reopening_temperature: !input temperature_reopen_threshold
+  co2_entities: !input co2_sensors
+  tvoc_entities: !input tvoc_sensors
+  co2_open: !input co2_open_threshold
+  tvoc_open: !input tvoc_open_threshold
+  windows: !input window_entities
+  notifications_enabled: !input enable_notifications
+  contacts: !input window_contacts
 
 triggers:
   - trigger: state
@@ -269,6 +369,58 @@ triggers:
   - trigger: homeassistant
     event: start
     id: startup
+  - trigger: template
+    id: air_blocked
+    value_template: &air_blocked_condition >-
+      {% set ns = namespace(high=false, valid=true, temperatures=[], units=[]) %}
+      {% for entity in co2_entities + tvoc_entities %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or value | float < 0 %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% if entity in co2_entities %}
+            {% if unit != 'ppm' %}
+              {% set ns.valid = false %}
+            {% else %}
+              {% set ns.high = ns.high or value | float >= co2_open | float %}
+            {% endif %}
+          {% endif %}
+          {% if entity in tvoc_entities %}
+            {% set ns.units = ns.units + [unit] %}
+            {% set ns.high = ns.high or value | float >= tvoc_open | float %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set sensors = selected_temperature_sensors %}
+      {% if sensors | count == 0 %}
+        {% set sensors = area_entities(selected_area)
+           | select('match', '^sensor[.]')
+           | select('is_state_attr', 'device_class', 'temperature') | list %}
+      {% endif %}
+      {% for entity in sensors %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+             else value - 273.15 if unit == 'K' else value %}
+          {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
+        {% endif %}
+      {% endfor %}
+      {% set no_open_windows = windows | select('is_state', 'open') | list | count == 0
+         and windows | select('is_state', 'opening') | list | count == 0
+         and (contacts is not mapping or contacts.values() | select('is_state', 'on') | list | count == 0) %}
+      {% set no_available_windows = windows | select('is_state', 'closed') | list | count == 0
+         and windows | select('is_state', 'closing') | list | count == 0 %}
+      {% set blocked = notifications_enabled and ns.high and no_open_windows
+         and (not ns.valid or ns.temperatures | count == 0
+              or ns.units | unique | list | count > 1
+              or no_available_windows
+              or ns.temperatures | min < reopening_temperature | float) %}
+      {{ blocked != (invert_blocked_check | default(false)) }}
   - trigger: time_pattern
     minutes: "/1"
     id: periodic_check
@@ -289,14 +441,57 @@ actions:
       minimum_temperature: !input temperature_close_threshold
       reopening_temperature: !input temperature_reopen_threshold
       cold_close_delay: !input temperature_close_delay
+      contacts: !input window_contacts
+      confirmation_timeout: !input close_confirmation_timeout
+      retry_count: !input close_retry_count
+      status_entity: !input status_entity
+      notifications_enabled: !input enable_notifications
+      blocked_air_delay: !input blocked_air_notification_delay
+      invert_blocked_check: false
+      notification_prefix: "air_ventilation_{{ this.entity_id | replace('.', '_') }}"
 
-  - condition: template
-    alias: "Выбраны датчики и заданы разные пороги открытия/закрытия"
-    value_template: >-
-      {{ windows | count > 0 and co2_entities | count + tvoc_entities | count > 0
+  - variables:
+      configuration_valid: >-
+        {% set ns = namespace(valid=contacts is mapping) %}
+        {% if contacts is mapping %}
+          {% for window, sensor in contacts.items() %}
+            {% if window not in windows or sensor is not string
+               or not sensor.startswith('binary_sensor.') %}
+              {% set ns.valid = false %}
+            {% endif %}
+          {% endfor %}
+          {% if ns.valid and contacts.values() | list | unique | list | count != contacts | count %}
+            {% set ns.valid = false %}
+          {% endif %}
+        {% endif %}
+        {{ ns.valid and windows | count > 0 and co2_entities | count + tvoc_entities | count > 0
          and (co2_entities | count == 0 or co2_open | float > co2_close | float)
          and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
          and reopening_temperature | float > minimum_temperature | float }}
+
+  - if:
+      - condition: template
+        value_template: "{{ not configuration_valid }}"
+    then:
+      - variables:
+          ventilation_status: "Ошибка настроек: проверьте датчики, пороги и пары окон с контактами"
+      - &publish_status
+        if:
+          - condition: template
+            value_template: >-
+              {{ status_entity | length > 0 and states(status_entity) not in ['unknown', 'unavailable']
+                 and states(status_entity) != ventilation_status[:state_attr(status_entity, 'max') | int(255)] }}
+        then:
+          - action: input_text.set_value
+            continue_on_error: true
+            target:
+              entity_id: "{{ status_entity }}"
+            data:
+              value: "{{ ventilation_status[:state_attr(status_entity, 'max') | int(255)] }}"
+
+  - condition: template
+    alias: "Выбраны датчики и заданы корректные пороги и контакты"
+    value_template: "{{ configuration_valid }}"
 
   - &refresh_temperature_entities
     variables:
@@ -309,7 +504,7 @@ actions:
   - &refresh_readings
     variables:
       readings: >-
-        {% set ns = namespace(valid=true, high=false, recovered=true,
+        {% set ns = namespace(valid=true, high=false, high_co2=false, high_tvoc=false, recovered=true,
            temperatures=[], tvoc_units=[]) %}
         {% for entity in co2_entities + tvoc_entities %}
           {% set value = states(entity) %}
@@ -323,11 +518,13 @@ actions:
             {% if entity in co2_entities %}
               {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
               {% set ns.high = ns.high or value >= co2_open | float %}
+              {% set ns.high_co2 = ns.high_co2 or value >= co2_open | float %}
               {% set ns.recovered = ns.recovered and value <= co2_close | float %}
             {% endif %}
             {% if entity in tvoc_entities %}
               {% set ns.tvoc_units = ns.tvoc_units + [unit] %}
               {% set ns.high = ns.high or value >= tvoc_open | float %}
+              {% set ns.high_tvoc = ns.high_tvoc or value >= tvoc_open | float %}
               {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
             {% endif %}
           {% endif %}
@@ -346,10 +543,11 @@ actions:
         {% endfor %}
         {{ dict(valid=ns.valid and ns.temperatures | count > 0
              and ns.tvoc_units | unique | list | count <= 1,
-           high=ns.high, recovered=ns.recovered,
+           high=ns.high, high_co2=ns.high_co2, high_tvoc=ns.high_tvoc, recovered=ns.recovered,
            temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
 
-  - variables:
+  - &refresh_decision
+    variables:
       window_action: >-
         {% if not readings.valid %}
           close
@@ -362,6 +560,100 @@ actions:
         {% else %}
           hold
         {% endif %}
+      ventilation_status: >-
+        {% set unconfirmed = namespace(found=false) %}
+        {% for window, sensor in contacts.items() %}
+          {% if not is_state(sensor, 'off') %}
+            {% set unconfirmed.found = true %}
+          {% endif %}
+        {% endfor %}
+        {% if status_entity | length > 0
+           and states(status_entity).startswith('Закрытие не подтверждено:')
+           and unconfirmed.found and window_action in ['close', 'close_cold'] %}
+          Закрытие не подтверждено: проверьте окно и контактный датчик
+        {% elif not readings.valid %}
+          Закрытие: нет корректных показаний датчиков
+        {% elif readings.recovered %}
+          Закрытие: качество воздуха восстановлено
+        {% elif readings.temperature <= minimum_temperature | float %}
+          {% if windows | select('is_state', 'open') | list | count == 0
+             and windows | select('is_state', 'opening') | list | count == 0
+             and contacts.values() | select('is_state', 'on') | list | count == 0 %}
+            Открытие запрещено: в комнате холодно
+          {% elif cold_close_delay | float > 0 %}
+            Ожидание закрытия по холоду: {{ cold_close_delay }} мин
+          {% else %}
+            Закрытие: низкая температура
+          {% endif %}
+        {% elif readings.high and readings.temperature < reopening_temperature | float %}
+          Открытие запрещено: ожидание прогрева комнаты
+        {% elif readings.high %}
+          {% if windows | select('is_state', 'closed') | list | count == 0
+             and windows | select('is_state', 'closing') | list | count == 0
+             and windows | select('is_state', 'open') | list | count == 0
+             and windows | select('is_state', 'opening') | list | count == 0 %}
+            Открытие недоступно: приводы окон не отвечают
+          {% else %}
+            Проветривание: {{ 'CO₂ и TVOC' if readings.high_co2 and readings.high_tvoc
+               else 'CO₂' if readings.high_co2 else 'TVOC' }} выше порога
+          {% endif %}
+        {% else %}
+          Сохранение положения: показатели между порогами
+        {% endif %}
+
+  - *publish_status
+
+  # Один монитор на начало блокировки; startup и пятиминутные проверки
+  # восстанавливают отсчёт после reload, если условие уже было истинным.
+  # CO₂/TVOC могут обновляться, не перезапуская ожидание.
+  - if:
+      - condition: template
+        value_template: *air_blocked_condition
+      - condition: template
+        value_template: >-
+          {{ trigger is not defined
+             or trigger.id | default('') in ['air_blocked', 'startup']
+             or (trigger.id | default('') == 'periodic_check' and now().minute % 5 == 0) }}
+    then:
+      - variables:
+          invert_blocked_check: true
+      - wait_template: *air_blocked_condition
+        timeout:
+          minutes: "{{ blocked_air_delay | float }}"
+        continue_on_timeout: true
+      - variables:
+          blocked_wait_completed: "{{ wait.completed }}"
+          invert_blocked_check: false
+      - *refresh_temperature_entities
+      - *refresh_readings
+      - *refresh_decision
+      - *publish_status
+      - if:
+          - condition: template
+            value_template: "{{ not blocked_wait_completed }}"
+          - condition: template
+            value_template: *air_blocked_condition
+        then:
+          - action: persistent_notification.create
+            continue_on_error: true
+            data:
+              notification_id: "{{ notification_prefix }}_blocked"
+              title: "Проветривание: открытие заблокировано"
+              message: >-
+                {{ area_name(selected_area) }}: CO₂ или TVOC остаётся высоким
+                не менее {{ blocked_air_delay }} мин, а окна не открываются.
+                {{ ventilation_status }}.
+      - stop: "Завершено наблюдение за заблокированным проветриванием"
+
+  - if:
+      - condition: template
+        value_template: *air_blocked_condition
+    then: []
+    else:
+      - action: persistent_notification.dismiss
+        continue_on_error: true
+        data:
+          notification_id: "{{ notification_prefix }}_blocked"
 
   - if:
       - condition: template
@@ -382,7 +674,8 @@ actions:
       - condition: template
         value_template: >-
           {{ windows | select('is_state', 'open') | list | count > 0
-             or windows | select('is_state', 'opening') | list | count > 0 }}
+             or windows | select('is_state', 'opening') | list | count > 0
+             or contacts.values() | select('is_state', 'on') | list | count > 0 }}
       - wait_template: >-
           {% set ns = namespace(values=[], valid=true) %}
           {% set sensors = selected_temperature_sensors %}
@@ -417,12 +710,21 @@ actions:
              or (not wait.completed and readings.temperature <= minimum_temperature | float) }}
       - variables:
           window_action: close
+          ventilation_status: "Закрытие: низкая температура после ожидания"
+      - *publish_status
+
+  - variables:
+      closing_requests: []
 
   # Только явный список cover; Area используется исключительно для датчиков.
-  # Не отправляем повторные команды уже открытым/закрытым/движущимся окнам.
+  # Контакт on имеет приоритет над оптимистичным состоянием cover closed.
+  # Без контакта уже закрытые/закрывающиеся окна повторно не трогаем.
   - repeat:
       for_each: "{{ windows | unique | list }}"
       sequence:
+        - variables:
+            current_window: "{{ repeat.item }}"
+            contact_sensor: "{{ contacts.get(repeat.item, '') }}"
         # Другой запуск мог отреагировать на прогрев или потерю показаний,
         # пока выполнялась команда предыдущему окну.
         - *refresh_temperature_entities
@@ -434,12 +736,20 @@ actions:
                     {{ window_action == 'close'
                        and (not readings.valid or readings.recovered
                             or readings.temperature <= minimum_temperature | float)
-                       and states(repeat.item) in ['open', 'opening'] }}
+                       and (states(current_window) in ['open', 'opening']
+                            or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
+                                and states(current_window) not in ['unknown', 'unavailable'])) }}
               sequence:
                 - action: cover.close_cover
                   continue_on_error: true
                   target:
-                    entity_id: "{{ repeat.item }}"
+                    entity_id: "{{ current_window }}"
+                - if:
+                    - condition: template
+                      value_template: "{{ contact_sensor | length > 0 }}"
+                  then:
+                    - variables:
+                        closing_requests: "{{ closing_requests + [current_window] }}"
             - conditions:
                 - condition: template
                   value_template: >-
@@ -451,4 +761,78 @@ actions:
                 - action: cover.open_cover
                   continue_on_error: true
                   target:
-                    entity_id: "{{ repeat.item }}"
+                    entity_id: "{{ current_window }}"
+
+        - if:
+            - condition: template
+              value_template: "{{ contact_sensor | length > 0 and is_state(contact_sensor, 'off') }}"
+          then:
+            - action: persistent_notification.dismiss
+              continue_on_error: true
+              data:
+                notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"
+
+  # Сначала команды отправлены всем окнам, затем проверяем контакты.
+  # Ожидание одного датчика не задерживает первоначальное закрытие остальных.
+  - repeat:
+      for_each: "{{ closing_requests }}"
+      sequence:
+        - variables:
+            current_window: "{{ repeat.item }}"
+            contact_sensor: "{{ contacts[current_window] }}"
+        - wait_template: "{{ is_state(contact_sensor, 'off') }}"
+          timeout:
+            seconds: "{{ confirmation_timeout | float }}"
+          continue_on_timeout: true
+        - repeat:
+            count: "{{ retry_count | int }}"
+            sequence:
+              - *refresh_temperature_entities
+              - *refresh_readings
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ is_state(contact_sensor, 'on')
+                         and states(current_window) not in ['unknown', 'unavailable']
+                         and (not readings.valid or readings.recovered
+                              or readings.temperature <= minimum_temperature | float) }}
+                then:
+                  - action: cover.close_cover
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ current_window }}"
+                  - wait_template: "{{ is_state(contact_sensor, 'off') }}"
+                    timeout:
+                      seconds: "{{ confirmation_timeout | float }}"
+                    continue_on_timeout: true
+        - *refresh_temperature_entities
+        - *refresh_readings
+        - if:
+            - condition: template
+              value_template: >-
+                {{ not is_state(contact_sensor, 'off')
+                   and (not readings.valid or readings.recovered
+                        or readings.temperature <= minimum_temperature | float) }}
+          then:
+            - variables:
+                ventilation_status: "Закрытие не подтверждено: проверьте окно и контактный датчик"
+            - *publish_status
+            - if:
+                - condition: template
+                  value_template: "{{ notifications_enabled }}"
+              then:
+                - action: persistent_notification.create
+                  continue_on_error: true
+                  data:
+                    notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"
+                    title: "Проветривание: окно не подтвердило закрытие"
+                    message: >-
+                      {{ state_attr(current_window, 'friendly_name') or current_window }}:
+                      датчик {{ contact_sensor }} показывает {{ states(contact_sensor) }}
+                      после команды закрытия и доступных повторов.
+                      Проверьте окно и контактный датчик.
+          else:
+            - action: persistent_notification.dismiss
+              continue_on_error: true
+              data:
+                notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"

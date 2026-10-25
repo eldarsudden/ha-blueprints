@@ -37,8 +37,9 @@ blueprint:
     Увеличение открытия при нормальном воздухе по-прежнему разрешается
     только после прогрева до порога повторного открытия.
 
-    Реагирует на изменение показаний и состояния окон, запуск HA и раз
-    в минуту повторяет проверку. Датчики температуры из Area также
+    Реагирует на достижение порогов CO₂/TVOC, потерю и восстановление
+    корректных показаний, изменение температуры и состояния окон, запуск HA.
+    Раз в минуту повторяет проверку. Датчики температуры из Area также
     отслеживаются при пересечении температурных порогов.
     Управляет и окнами, открытыми вручную, пока автоматизация включена.
     Перезапуск HA или перезагрузка автоматики сбрасывают отсчёт задержки.
@@ -380,7 +381,9 @@ trigger_variables:
   co2_entities: !input co2_sensors
   tvoc_entities: !input tvoc_sensors
   co2_open: !input co2_open_threshold
+  co2_close: !input co2_close_threshold
   tvoc_open: !input tvoc_open_threshold
+  tvoc_close: !input tvoc_close_threshold
   windows: !input window_entities
   notifications_enabled: !input enable_notifications
   contact_pairs: !input window_contacts
@@ -406,17 +409,125 @@ trigger_variables:
     {% endif %}
 
 triggers:
-  - trigger: state
-    entity_id: !input co2_sensors
-    id: co2_changed
-  - trigger: state
-    entity_id: !input tvoc_sensors
-    id: tvoc_changed
+  # Запускаем действия при достижении порогов и потере/восстановлении
+  # корректных показаний, а не на каждом изменении CO₂/TVOC на одну единицу.
+  - trigger: template
+    id: air_high
+    alias: "CO₂ или TVOC достиг порога открытия"
+    value_template: >-
+      {% set ns = namespace(valid=true, high=false, recovered=true, units=[]) %}
+      {% for entity in co2_entities + tvoc_entities %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or value | float < 0 %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% if entity in co2_entities %}
+            {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+            {% set ns.high = ns.high or value >= co2_open | float %}
+            {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+          {% endif %}
+          {% if entity in tvoc_entities %}
+            {% set ns.units = ns.units + [unit] %}
+            {% set ns.high = ns.high or value >= tvoc_open | float %}
+            {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
+         and ns.units | unique | list | count <= 1 %}
+      {{ valid and ns.high }}
+  - trigger: template
+    id: air_recovered
+    alias: "Все показатели воздуха снизились до порогов закрытия"
+    value_template: >-
+      {% set ns = namespace(valid=true, high=false, recovered=true, units=[]) %}
+      {% for entity in co2_entities + tvoc_entities %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or value | float < 0 %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% if entity in co2_entities %}
+            {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+            {% set ns.high = ns.high or value >= co2_open | float %}
+            {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+          {% endif %}
+          {% if entity in tvoc_entities %}
+            {% set ns.units = ns.units + [unit] %}
+            {% set ns.high = ns.high or value >= tvoc_open | float %}
+            {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
+         and ns.units | unique | list | count <= 1 %}
+      {{ valid and ns.recovered }}
+  - trigger: template
+    id: air_unavailable
+    alias: "Показания датчиков воздуха некорректны"
+    value_template: >-
+      {% set ns = namespace(valid=true, high=false, recovered=true, units=[]) %}
+      {% for entity in co2_entities + tvoc_entities %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or value | float < 0 %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% if entity in co2_entities %}
+            {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+            {% set ns.high = ns.high or value >= co2_open | float %}
+            {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+          {% endif %}
+          {% if entity in tvoc_entities %}
+            {% set ns.units = ns.units + [unit] %}
+            {% set ns.high = ns.high or value >= tvoc_open | float %}
+            {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
+         and ns.units | unique | list | count <= 1 %}
+      {{ not valid }}
+  - trigger: template
+    id: air_intermediate
+    alias: "Корректные показания воздуха между порогами"
+    value_template: >-
+      {% set ns = namespace(valid=true, high=false, recovered=true, units=[]) %}
+      {% for entity in co2_entities + tvoc_entities %}
+        {% set value = states(entity) %}
+        {% set unit = state_attr(entity, 'unit_of_measurement') %}
+        {% if not is_number(value) or value | float < 0 %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set value = value | float %}
+          {% if entity in co2_entities %}
+            {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+            {% set ns.high = ns.high or value >= co2_open | float %}
+            {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+          {% endif %}
+          {% if entity in tvoc_entities %}
+            {% set ns.units = ns.units + [unit] %}
+            {% set ns.high = ns.high or value >= tvoc_open | float %}
+            {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
+         and ns.units | unique | list | count <= 1 %}
+      {{ valid and not ns.high and not ns.recovered }}
+  # to: null игнорирует изменения атрибутов, в частности last_seen,
+  # linkquality и current_position при движении окна.
   - trigger: state
     entity_id: !input temperature_sensors
+    to: null
     id: temperature_changed
   - trigger: state
     entity_id: !input window_entities
+    to: null
     id: window_changed
   # Автоматически найденные датчики нельзя подставить в статический state
   # trigger. Шаблоны следят за холодом/потерей показаний и прогревом комнаты.
@@ -931,6 +1042,9 @@ actions:
   # Только явный список cover; Area используется исключительно для датчиков.
   # Контакт on имеет приоритет над оптимистичным состоянием cover closed.
   # Без контакта уже закрытые/закрывающиеся окна повторно не трогаем.
+  # События closed/closing от команды приводу не запускают новый цикл
+  # подтверждения: контакт уже проверяется после первоначальной команды.
+  # Остальные события и периодическая проверка сохраняют повторные попытки.
   - repeat:
       for_each: "{{ windows | unique | list }}"
       sequence:
@@ -958,7 +1072,11 @@ actions:
                     {{ window_action in ['close', 'position'] and full_close_required
                        and (states(current_window) in ['open', 'opening']
                             or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
-                                and states(current_window) not in ['unknown', 'unavailable'])) }}
+                                and states(current_window) not in ['unknown', 'unavailable']
+                                and not (trigger is defined
+                                    and trigger.id | default('') == 'window_changed'
+                                    and trigger.entity_id | default('') == current_window
+                                    and states(current_window) in ['closed', 'closing']))) }}
               sequence:
                 - action: cover.close_cover
                   continue_on_error: true

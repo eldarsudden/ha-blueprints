@@ -1,9 +1,13 @@
 blueprint:
   name: "Air Quality Window Ventilation"
   description: >-
-    Открывает выбранные окна при повышении CO₂ или TVOC и закрывает,
-    когда все выбранные показатели снизились до порогов закрытия.
+    Открывает выбранные окна при повышении CO₂ или TVOC. Когда все
+    выбранные показатели снизились до порогов закрытия, закрывает окна
+    полностью или оставляет их приоткрытыми на заданный процент.
     Отдельные пороги открытия и закрытия предотвращают частые переключения.
+    По умолчанию положение при нормальном воздухе равно 0% — закрыто.
+    Приоткрытие требует управления положением и показаний текущего положения;
+    без них соответствующее окно закрывается полностью.
 
     При снижении температуры комнаты до минимального значения окно
     закрывается после настраиваемой задержки независимо от качества воздуха.
@@ -24,6 +28,9 @@ blueprint:
     При недоступности любого выбранного датчика или отсутствии пригодных
     температурных датчиков окно закрывается; открытие блокируется до
     восстановления показаний. Недоступные окна пропускаются.
+    Защита по холоду и потере показаний всегда закрывает окно полностью.
+    Увеличение открытия, включая приоткрытие при нормальном воздухе,
+    разрешается только после прогрева до порога повторного открытия.
 
     Реагирует на изменение показаний и состояния окон, запуск HA и раз
     в минуту повторяет проверку. Датчики температуры из Area также
@@ -43,6 +50,7 @@ blueprint:
     команды закрытия проверяется контакт, выполняется ограниченное число
     повторов за одну проверку и выводится уведомление при неудаче.
     Новые события и периодические проверки могут повторять попытку закрытия.
+    При намеренном приоткрытии подтверждение полного закрытия не требуется.
   domain: automation
   homeassistant:
     min_version: 2025.9.0
@@ -68,6 +76,25 @@ blueprint:
               multiple: true
               filter:
                 - domain: cover
+        air_recovered_position:
+          name: "Положение окна при нормальном воздухе"
+          description: >-
+            Когда все выбранные CO₂/TVOC снизились до порогов закрытия:
+            0% = полностью закрыто, 10% = слегка открыто, 100% = полностью
+            открыто. Положение поддерживается автоматически, в том числе
+            после ручного закрытия. Увеличение открытия разрешено только
+            после прогрева до порога повторного открытия. При холоде или
+            потере показаний окно закрывается полностью. Если привод
+            не поддерживает управление положением или не сообщает его,
+            выполняется полное закрытие. Сначала завершается текущее движение.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
 
     co2_section:
       name: "CO₂"
@@ -481,6 +508,7 @@ actions:
       minimum_temperature: !input temperature_close_threshold
       reopening_temperature: !input temperature_reopen_threshold
       cold_close_delay: !input temperature_close_delay
+      normal_position: !input air_recovered_position
       contact_pairs: !input window_contacts
       contacts: *normalize_contacts
       confirmation_timeout: !input close_confirmation_timeout
@@ -508,6 +536,8 @@ actions:
         {{ ns.valid and windows | count > 0 and co2_entities | count + tvoc_entities | count > 0
          and (co2_entities | count == 0 or co2_open | float > co2_close | float)
          and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
+         and is_number(normal_position) and 0 <= normal_position | float <= 100
+         and normal_position | float == normal_position | int
          and reopening_temperature | float > minimum_temperature | float }}
 
   - alias: "Сообщить об ошибке настроек"
@@ -599,7 +629,8 @@ actions:
         {% if not readings.valid %}
           close
         {% elif readings.recovered %}
-          close
+          {{ 'position' if normal_position | int > 0
+             and readings.temperature > minimum_temperature | float else 'close' }}
         {% elif readings.temperature <= minimum_temperature | float %}
           {{ 'close_cold' if cold_close_delay | float > 0 else 'close' }}
         {% elif readings.high and readings.temperature >= reopening_temperature | float %}
@@ -621,7 +652,21 @@ actions:
         {% elif not readings.valid %}
           Закрытие: нет корректных показаний датчиков
         {% elif readings.recovered %}
-          Закрытие: качество воздуха восстановлено
+          {% if window_action == 'position' %}
+            {% set ns = namespace(fallback=false) %}
+            {% for window in windows %}
+              {% set position = state_attr(window, 'current_position') %}
+              {% if state_attr(window, 'supported_features') | int(0) | bitwise_and(4) == 0
+                 or not is_number(position) or not 0 <= position | float <= 100 %}
+                {% set ns.fallback = true %}
+              {% endif %}
+            {% endfor %}
+            Воздух в норме: целевое открытие {{ normal_position | int }}%;
+            увеличение открытия разрешено от {{ reopening_temperature }} °C
+            {{ '; окна без управления положением закрываются полностью' if ns.fallback else '' }}
+          {% else %}
+            Закрытие: качество воздуха восстановлено
+          {% endif %}
         {% elif readings.temperature <= minimum_temperature | float %}
           {% if windows | select('is_state', 'open') | list | count == 0
              and windows | select('is_state', 'opening') | list | count == 0
@@ -770,7 +815,9 @@ actions:
           - condition: template
             alias: "После ожидания закрытие всё ещё необходимо"
             value_template: >-
-              {{ not readings.valid or readings.recovered
+              {{ not readings.valid
+                 or (readings.recovered and (normal_position | int == 0
+                     or readings.temperature <= minimum_temperature | float))
                  or (not wait.completed and readings.temperature <= minimum_temperature | float) }}
           - variables:
               window_action: close
@@ -793,14 +840,21 @@ actions:
         # пока выполнялась команда предыдущему окну.
         - *refresh_temperature_entities
         - *refresh_readings
+        - &refresh_window_requirements
+          variables:
+            current_position: "{{ state_attr(current_window, 'current_position') }}"
+            position_available: >-
+              {{ state_attr(current_window, 'supported_features') | int(0) | bitwise_and(4) != 0
+                 and is_number(current_position) and 0 <= current_position | float <= 100 }}
+            full_close_required: >-
+              {{ not readings.valid or readings.temperature <= minimum_temperature | float
+                 or (readings.recovered and (normal_position | int == 0 or not position_available)) }}
         - choose:
             - conditions:
                 - condition: template
                   alias: "Окно нужно закрыть по актуальным показаниям"
                   value_template: >-
-                    {{ window_action == 'close'
-                       and (not readings.valid or readings.recovered
-                            or readings.temperature <= minimum_temperature | float)
+                    {{ window_action in ['close', 'position'] and full_close_required
                        and (states(current_window) in ['open', 'opening']
                             or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
                                 and states(current_window) not in ['unknown', 'unavailable'])) }}
@@ -820,24 +874,45 @@ actions:
                             closing_requests: "{{ closing_requests + [current_window] }}"
             - conditions:
                 - condition: template
+                  alias: "Воздух в норме и можно установить заданное положение окна"
+                  value_template: >-
+                    {{ window_action == 'position' and readings.valid and readings.recovered
+                       and readings.temperature > minimum_temperature | float
+                       and position_available and states(current_window) in ['open', 'closed']
+                       and current_position | float != normal_position | int
+                       and (current_position | float > normal_position | int
+                            or readings.temperature >= reopening_temperature | float) }}
+              sequence:
+                - action: cover.set_cover_position
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ current_window }}"
+                  data:
+                    position: "{{ normal_position | int }}"
+            - conditions:
+                - condition: template
                   alias: "Воздух требует проветривания и температура разрешает открытие"
                   value_template: >-
                     {{ window_action == 'open'
                        and readings.valid and readings.high and not readings.recovered
                        and readings.temperature >= reopening_temperature | float
-                       and states(repeat.item) in ['closed', 'closing'] }}
+                       and (states(current_window) in ['closed', 'closing']
+                            or (normal_position | int > 0 and is_state(current_window, 'open')
+                                and is_number(current_position) and current_position | float < 100)) }}
               sequence:
                 - action: cover.open_cover
                   continue_on_error: true
                   target:
                     entity_id: "{{ current_window }}"
 
-        - alias: "Удалить уведомление после подтверждения закрытия"
+        - alias: "Удалить уведомление после закрытия или перехода к приоткрытию"
           choose:
             - conditions:
                 - condition: template
-                  alias: "Контактный датчик подтвердил закрытие окна"
-                  value_template: "{{ contact_sensor | length > 0 and is_state(contact_sensor, 'off') }}"
+                  alias: "Закрытие подтверждено или полное закрытие больше не требуется"
+                  value_template: >-
+                    {{ contact_sensor | length > 0 and (is_state(contact_sensor, 'off')
+                       or (readings.valid and readings.recovered and not full_close_required)) }}
               sequence:
                 - action: persistent_notification.dismiss
                   continue_on_error: true
@@ -861,6 +936,7 @@ actions:
             sequence:
               - *refresh_temperature_entities
               - *refresh_readings
+              - *refresh_window_requirements
               - alias: "Повторить закрытие при открытом контакте"
                 choose:
                   - conditions:
@@ -869,8 +945,7 @@ actions:
                         value_template: >-
                           {{ is_state(contact_sensor, 'on')
                              and states(current_window) not in ['unknown', 'unavailable']
-                             and (not readings.valid or readings.recovered
-                                  or readings.temperature <= minimum_temperature | float) }}
+                             and full_close_required }}
                     sequence:
                       - action: cover.close_cover
                         continue_on_error: true
@@ -882,15 +957,14 @@ actions:
                         continue_on_timeout: true
         - *refresh_temperature_entities
         - *refresh_readings
+        - *refresh_window_requirements
         - alias: "Обработать результат проверки закрытия"
           choose:
             - conditions:
                 - condition: template
                   alias: "Закрытие необходимо, но контакт его не подтвердил"
                   value_template: >-
-                    {{ not is_state(contact_sensor, 'off')
-                       and (not readings.valid or readings.recovered
-                            or readings.temperature <= minimum_temperature | float) }}
+                    {{ not is_state(contact_sensor, 'off') and full_close_required }}
               sequence:
                 - variables:
                     ventilation_status: "Закрытие не подтверждено: проверьте окно и контактный датчик"

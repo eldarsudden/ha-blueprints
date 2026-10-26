@@ -1,6 +1,20 @@
 blueprint:
   name: "Air Quality Window Ventilation"
   description: >-
+    Режимы: по датчикам, только периодически или оба способа одновременно.
+    Период задаётся между началами циклов; первый цикл начинается при первой
+    проверке. Периодический цикл имеет приоритет над всеми показаниями,
+    в том числе температурой и недоступностью датчиков: окно открывается
+    на заданное время, затем закрывается полностью. В объединённом режиме
+    после этого управление по датчикам может снова открыть окно.
+
+    Для ненулевой задержки закрытия по холоду выберите отдельный таймер
+    закрытия для каждого окна. Для периодического режима нужны отдельные
+    таймеры длительности для окон и один таймер периода. У всех помощников
+    «Таймер» включите восстановление после перезапуска. В объединённом
+    режиме два таймера одного окна должны быть разными. При обновлении
+    существующей автоматизации с задержкой выберите таймеры в новом разделе.
+
     Открывает выбранные окна при превышении заданных порогов CO₂ или TVOC.
     Когда все выбранные показатели снижаются ниже порогов закрытия,
     закрывает окна полностью или оставляет их приоткрытыми на заданный процент.
@@ -42,7 +56,9 @@ blueprint:
     Раз в минуту повторяет проверку. Датчики температуры из Area также
     отслеживаются при пересечении температурных порогов.
     Управляет и окнами, открытыми вручную, пока автоматизация включена.
-    Перезапуск HA или перезагрузка автоматики сбрасывают отсчёт задержки.
+    Отсчёт закрытия хранится в помощнике и сохраняется после перезапуска HA
+    и перезагрузки автоматизации. Закрытие окна или прогрев отменяют его.
+    Просроченное закрытие проверяется при запуске HA и раз в минуту.
     Требуются cover-сущности с поддержкой открытия и закрытия.
 
     Причина решения доступна в переменной ventilation_status трассировки.
@@ -62,6 +78,99 @@ blueprint:
     min_version: 2025.9.0
 
   input:
+    mode_section:
+      name: "Режим и таймеры"
+      icon: mdi:timer-outline
+      collapsed: false
+      input:
+        control_mode:
+          name: "Режим проветривания"
+          default: sensors
+          selector:
+            select:
+              options:
+                - label: "По датчикам"
+                  value: sensors
+                - label: "Периодически, независимо от всех датчиков"
+                  value: periodic
+                - label: "По датчикам и периодически"
+                  value: combined
+        window_close_timers:
+          name: "Таймеры закрытия окон"
+          description: >-
+            Создайте отдельный помощник «Таймер» для каждого окна и включите
+            у него восстановление после перезапуска. Они обязательны для
+            периодического режима и для ненулевой задержки закрытия по холоду.
+            Каждый таймер используется только этой автоматизацией и одним окном.
+            При одном выбранном окне поле «Окно» можно оставить пустым.
+          default: []
+          selector:
+            object:
+              multiple: true
+              label_field: window
+              description_field: window
+              fields:
+                window:
+                  label: "Окно (можно пропустить для одного окна)"
+                  required: false
+                  selector:
+                    entity:
+                      filter:
+                        - domain: cover
+                cold_timer:
+                  label: "Таймер закрытия по холоду с восстановлением"
+                  required: false
+                  selector:
+                    entity:
+                      filter:
+                        - domain: timer
+                periodic_timer:
+                  label: "Таймер длительности периодического проветривания"
+                  required: false
+                  selector:
+                    entity:
+                      filter:
+                        - domain: timer
+        periodic_interval:
+          name: "Период между началами проветриваний"
+          description: >-
+            Для периодического и объединённого режимов. Первый цикл начинается при
+            первой проверке; следующие — через заданный период. Период должен
+            быть больше длительности открытого состояния.
+          default: 120
+          selector:
+            number:
+              min: 1
+              max: 1440
+              step: 1
+              unit_of_measurement: "мин"
+              mode: box
+        periodic_open_duration:
+          name: "Длительность открытого состояния"
+          description: >-
+            Для периодического и объединённого режимов. После команды открытия
+            выдерживает это время и полностью закрывает окно. Показания
+            CO₂, TVOC и температуры, включая недоступность датчиков, игнорируются.
+          default: 5
+          selector:
+            number:
+              min: 0.5
+              max: 240
+              step: 0.5
+              unit_of_measurement: "мин"
+              mode: box
+        periodic_cycle_timer:
+          name: "Таймер периода между проветриваниями"
+          description: >-
+            Для периодического и объединённого режимов. Выберите ещё один отдельный
+            помощник «Таймер» с восстановлением после перезапуска.
+            Его нельзя использовать как таймер закрытия окна.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: timer
+
     room_section:
       name: "Комната и окна"
       icon: mdi:window-open
@@ -72,6 +181,8 @@ blueprint:
           description: >-
             Область для поиска комнатных датчиков температуры.
             Окна выбираются отдельно: управление всей областью не выполняется.
+            В периодическом режиме можно оставить пустым.
+          default: ""
           selector:
             area: {}
         window_entities:
@@ -364,15 +475,15 @@ blueprint:
               unit_of_measurement: "мин"
               mode: box
 
-# Ожидание закрытия по холоду не блокирует остальные проверки, в частности
-# немедленное закрытие при потере показаний или улучшении качества воздуха.
-# Ниже ограничены события, которые могут запускать длительное ожидание.
+# Закрытие по холоду и периодические циклы используют отдельные помощники,
+# а не параллельные ожидания. Проверки контактов и уведомлений независимы.
 mode: parallel
 max: 50
 
 # В trigger_variables только inputs: поиск датчиков происходит в шаблонах,
 # чтобы их изменения отслеживались, а не фиксировались при загрузке.
 trigger_variables:
+  control_mode: !input control_mode
   selected_area: !input room_area
   selected_temperature_sensors: !input temperature_sensors
   minimum_temperature: !input temperature_close_threshold
@@ -385,6 +496,41 @@ trigger_variables:
   tvoc_open: !input tvoc_open_threshold
   tvoc_close: !input tvoc_close_threshold
   windows: !input window_entities
+  timer_bindings: !input window_close_timers
+  periodic_cycle_timer: !input periodic_cycle_timer
+  timer_mappings: &normalize_close_timers >-
+    {% if timer_bindings is not sequence or timer_bindings is string %}
+      {{ none }}
+    {% else %}
+      {% set ns = namespace(cold=[], periodic=[], windows=[], valid=true) %}
+      {% for pair in timer_bindings %}
+        {% if pair is not mapping %}
+          {% set ns.valid = false %}
+        {% else %}
+          {% set window = pair.get('window') or (windows[0] if windows | count == 1 else '') %}
+          {% if window is not string or window in ns.windows %}
+            {% set ns.valid = false %}
+          {% else %}
+            {% set ns.windows = ns.windows + [window] %}
+            {% for field in ['cold_timer', 'periodic_timer'] %}
+              {% set timer = pair.get(field) %}
+              {% if timer %}
+                {% if timer is not string %}
+                  {% set ns.valid = false %}
+                {% elif field == 'cold_timer' %}
+                  {% set ns.cold = ns.cold + [(window, timer)] %}
+                {% else %}
+                  {% set ns.periodic = ns.periodic + [(window, timer)] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ dict(cold=dict(ns.cold), periodic=dict(ns.periodic)) if ns.valid else none }}
+    {% endif %}
+  close_timers: "{{ timer_mappings.cold if timer_mappings is mapping else {} }}"
+  periodic_timers: "{{ timer_mappings.periodic if timer_mappings is mapping else {} }}"
   notifications_enabled: !input enable_notifications
   contact_pairs: !input window_contacts
   # Форма возвращает список пар. Старые сохранённые словари поддерживаются.
@@ -409,6 +555,9 @@ trigger_variables:
     {% endif %}
 
 triggers:
+  - trigger: event
+    event_type: timer.finished
+    id: timer_finished
   # Запускаем действия при достижении порогов и потере/восстановлении
   # корректных показаний, а не на каждом изменении CO₂/TVOC на одну единицу.
   - trigger: template
@@ -437,7 +586,7 @@ triggers:
       {% endfor %}
       {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
          and ns.units | unique | list | count <= 1 %}
-      {{ valid and ns.high }}
+      {{ control_mode != 'periodic' and valid and ns.high }}
   - trigger: template
     id: air_recovered
     alias: "Все показатели воздуха снизились ниже порогов закрытия"
@@ -464,7 +613,7 @@ triggers:
       {% endfor %}
       {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
          and ns.units | unique | list | count <= 1 %}
-      {{ valid and ns.recovered }}
+      {{ control_mode != 'periodic' and valid and ns.recovered }}
   - trigger: template
     id: air_unavailable
     alias: "Показания датчиков воздуха некорректны"
@@ -491,7 +640,7 @@ triggers:
       {% endfor %}
       {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
          and ns.units | unique | list | count <= 1 %}
-      {{ not valid }}
+      {{ control_mode != 'periodic' and not valid }}
   - trigger: template
     id: air_intermediate
     alias: "Корректные показания воздуха между порогами"
@@ -518,11 +667,12 @@ triggers:
       {% endfor %}
       {% set valid = ns.valid and co2_entities | count + tvoc_entities | count > 0
          and ns.units | unique | list | count <= 1 %}
-      {{ valid and not ns.high and not ns.recovered }}
+      {{ control_mode != 'periodic' and valid and not ns.high and not ns.recovered }}
   # to: null игнорирует изменения атрибутов, в частности last_seen,
   # linkquality и current_position при движении окна.
   - trigger: state
     entity_id: !input temperature_sensors
+    enabled: "{{ control_mode != 'periodic' }}"
     to: null
     id: temperature_changed
   - trigger: state
@@ -553,8 +703,8 @@ triggers:
           {% set ns.values = ns.values + [celsius | round(3)] %}
         {% endif %}
       {% endfor %}
-      {{ not ns.valid or ns.values | count == 0
-         or ns.values | min <= minimum_temperature | float }}
+      {{ control_mode != 'periodic' and (not ns.valid or ns.values | count == 0
+         or ns.values | min <= minimum_temperature | float) }}
   - trigger: template
     id: room_warmed_up
     value_template: >-
@@ -577,7 +727,7 @@ triggers:
           {% set ns.values = ns.values + [celsius | round(3)] %}
         {% endif %}
       {% endfor %}
-      {{ ns.valid and ns.values | count > 0
+      {{ control_mode != 'periodic' and ns.valid and ns.values | count > 0
          and ns.values | min >= reopening_temperature | float }}
   - trigger: homeassistant
     event: start
@@ -628,7 +778,7 @@ triggers:
          and (contacts is not mapping or contacts.values() | select('is_state', 'on') | list | count == 0) %}
       {% set no_available_windows = windows | select('is_state', 'closed') | list | count == 0
          and windows | select('is_state', 'closing') | list | count == 0 %}
-      {% set blocked = notifications_enabled and ns.high and no_open_windows
+      {% set blocked = control_mode != 'periodic' and notifications_enabled and ns.high and no_open_windows
          and (not ns.valid or ns.temperatures | count == 0
               or ns.units | unique | list | count > 1
               or no_available_windows
@@ -639,14 +789,32 @@ triggers:
     minutes: "/1"
     id: periodic_check
 
-conditions: []
+conditions:
+  - condition: template
+    alias: "Событие относится к таймерам этой автоматизации"
+    value_template: >-
+      {{ trigger is not defined or trigger.id | default('') != 'timer_finished'
+         or (close_timers is mapping
+             and trigger.event.data.get('entity_id', '') in close_timers.values())
+         or (periodic_timers is mapping
+             and trigger.event.data.get('entity_id', '') in periodic_timers.values())
+         or (control_mode in ['periodic', 'combined']
+             and trigger.event.data.get('entity_id', '') == periodic_cycle_timer) }}
 
 # Используем choose для совместимости с просмотром трассировок HA:
 # https://github.com/home-assistant/frontend/pull/54910
 actions:
   - variables:
+      control_mode: !input control_mode
+      periodic_interval: !input periodic_interval
+      periodic_open_duration: !input periodic_open_duration
+      periodic_cycle_timer: !input periodic_cycle_timer
       selected_area: !input room_area
       windows: !input window_entities
+      timer_bindings: !input window_close_timers
+      timer_mappings: *normalize_close_timers
+      close_timers: "{{ timer_mappings.cold if timer_mappings is mapping else {} }}"
+      periodic_timers: "{{ timer_mappings.periodic if timer_mappings is mapping else {} }}"
       co2_entities: !input co2_sensors
       tvoc_entities: !input tvoc_sensors
       selected_temperature_sensors: !input temperature_sensors
@@ -658,7 +826,6 @@ actions:
       reopening_temperature: !input temperature_reopen_threshold
       allow_cold_ventilation: !input allow_cold_ventilation
       cold_ventilation_pause: !input cold_ventilation_pause
-      cold_ventilation_started: false
       cold_close_delay: !input temperature_close_delay
       normal_position: !input air_recovered_position
       contact_pairs: !input window_contacts
@@ -669,11 +836,16 @@ actions:
       notifications_enabled: !input enable_notifications
       blocked_air_delay: !input blocked_air_notification_delay
       invert_blocked_check: false
+      armed_timers: []
       notification_prefix: "air_ventilation_{{ this.entity_id | replace('.', '_') }}"
+      required_timers: >-
+        {{ (close_timers.values() | list if control_mode != 'periodic' and cold_close_delay | float > 0 else [])
+           + (periodic_timers.values() | list + [periodic_cycle_timer] if control_mode != 'sensors' else []) }}
 
   - variables:
       configuration_valid: >-
-        {% set ns = namespace(valid=contacts is mapping) %}
+        {% set ns = namespace(valid=contacts is mapping and timer_mappings is mapping
+           and control_mode in ['sensors', 'periodic', 'combined']) %}
         {% if contacts is mapping %}
           {% for window, sensor in contacts.items() %}
             {% if window not in windows or sensor is not string
@@ -685,13 +857,37 @@ actions:
             {% set ns.valid = false %}
           {% endif %}
         {% endif %}
-        {{ ns.valid and windows | count > 0 and co2_entities | count + tvoc_entities | count > 0
-         and (co2_entities | count == 0 or co2_open | float > co2_close | float)
-         and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
-         and is_number(normal_position) and 0 <= normal_position | float <= 100
-         and normal_position | float == normal_position | int
-         and is_number(cold_ventilation_pause) and 1 <= cold_ventilation_pause | float <= 1440
-         and reopening_temperature | float > minimum_temperature | float }}
+        {% set all_timers = close_timers.values() | list + periodic_timers.values() | list %}
+        {% if periodic_cycle_timer | length > 0 %}
+          {% set all_timers = all_timers + [periodic_cycle_timer] %}
+        {% endif %}
+        {% for window, timer in (close_timers.items() | list + periodic_timers.items() | list) %}
+          {% if window not in windows or not timer.startswith('timer.') %}
+            {% set ns.valid = false %}
+          {% endif %}
+        {% endfor %}
+        {% if all_timers | unique | list | count != all_timers | count %}
+          {% set ns.valid = false %}
+        {% endif %}
+        {% for window in windows %}
+          {% if (control_mode != 'periodic' and cold_close_delay | float > 0 and window not in close_timers)
+             or (control_mode != 'sensors' and window not in periodic_timers) %}
+            {% set ns.valid = false %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.valid and windows | count > 0
+         and (control_mode == 'periodic' or (
+              co2_entities | count + tvoc_entities | count > 0
+              and (co2_entities | count == 0 or co2_open | float > co2_close | float)
+              and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
+              and is_number(normal_position) and 0 <= normal_position | float <= 100
+              and normal_position | float == normal_position | int
+              and is_number(cold_ventilation_pause) and 1 <= cold_ventilation_pause | float <= 1440
+              and reopening_temperature | float > minimum_temperature | float))
+         and (control_mode == 'sensors' or (
+              periodic_cycle_timer.startswith('timer.')
+              and is_number(periodic_interval) and is_number(periodic_open_duration)
+              and 0 < periodic_open_duration | float < periodic_interval | float)) }}
 
   - alias: "Сообщить об ошибке настроек"
     choose:
@@ -701,7 +897,7 @@ actions:
             value_template: "{{ not configuration_valid }}"
         sequence:
           - variables:
-              ventilation_status: "Ошибка настроек: проверьте датчики, пороги и пары окон с контактами"
+              ventilation_status: "Ошибка настроек: проверьте режим, датчики, пороги, контакты и отдельные таймеры для окон"
           - &publish_status
             alias: "Обновить текстовый статус"
             choose:
@@ -718,6 +914,20 @@ actions:
                       entity_id: "{{ status_entity }}"
                     data:
                       value: "{{ ventilation_status[:state_attr(status_entity, 'max') | int(255)] }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ notifications_enabled }}"
+                sequence:
+                  - action: persistent_notification.create
+                    data:
+                      notification_id: "{{ notification_prefix }}_configuration"
+                      title: "Проветривание: ошибка настроек"
+                      message: >-
+                        {{ ventilation_status }}. Для задержки закрытия по холоду нужен
+                        отдельный таймер каждого окна; для периодического режима —
+                        отдельные таймеры длительности и периода. Включите восстановление
+                        у всех помощников «Таймер».
 
   - condition: template
     alias: "Выбраны датчики и заданы корректные пороги и контакты"
@@ -779,7 +989,9 @@ actions:
   - &refresh_decision
     variables:
       window_action: >-
-        {% if not readings.valid %}
+        {% if control_mode == 'periodic' %}
+          hold
+        {% elif not readings.valid %}
           close
         {% elif readings.recovered %}
           {{ 'position' if normal_position | int > 0
@@ -791,6 +1003,15 @@ actions:
         {% else %}
           hold
         {% endif %}
+      timer_issues: >-
+        {% set ns = namespace(issues=[]) %}
+        {% for timer in required_timers %}
+          {% if states(timer) not in ['idle', 'active', 'paused']
+             or not is_state_attr(timer, 'restore', true) %}
+            {% set ns.issues = ns.issues + [timer] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.issues }}
       ventilation_status: >-
         {% set unconfirmed = namespace(found=false) %}
         {% for window, sensor in contacts.items() %}
@@ -798,7 +1019,19 @@ actions:
             {% set unconfirmed.found = true %}
           {% endif %}
         {% endfor %}
-        {% if status_entity | length > 0
+        {% set periodic_open = namespace(active=false) %}
+        {% if control_mode != 'sensors' %}
+          {% for timer in periodic_timers.values() %}
+            {% if is_state(timer, 'active') %}{% set periodic_open.active = true %}{% endif %}
+          {% endfor %}
+        {% endif %}
+        {% if timer_issues | count > 0 %}
+          Ошибка таймеров: проверьте доступность и восстановление {{ timer_issues | join(', ') }}
+        {% elif periodic_open.active %}
+          Периодическое проветривание: {{ periodic_open_duration }} мин независимо от датчиков
+        {% elif control_mode == 'periodic' %}
+          Периодическое проветривание: ожидание следующего цикла, период {{ periodic_interval }} мин
+        {% elif status_entity | length > 0
            and states(status_entity).startswith('Закрытие не подтверждено:')
            and unconfirmed.found and window_action in ['close', 'close_cold'] %}
           Закрытие не подтверждено: проверьте окно и контактный датчик
@@ -862,6 +1095,107 @@ actions:
 
   - *publish_status
 
+  - alias: "Сообщить о недоступных таймерах или выключенном восстановлении"
+    choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ notifications_enabled and timer_issues | count > 0 }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              notification_id: "{{ notification_prefix }}_configuration"
+              title: "Проветривание: проверьте таймеры"
+              message: "{{ ventilation_status }}"
+    default:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: "{{ notification_prefix }}_configuration"
+
+  - alias: "Согласовать таймер периода с выбранным режимом"
+    choose:
+      - conditions:
+          - condition: template
+            alias: "Периодический режим выключен — отменить его расписание"
+            value_template: >-
+              {{ control_mode == 'sensors' and periodic_cycle_timer | length > 0
+                 and states(periodic_cycle_timer) in ['active', 'paused'] }}
+        sequence:
+          - action: timer.cancel
+            target:
+              entity_id: "{{ periodic_cycle_timer }}"
+      - conditions:
+          - condition: template
+            alias: "Возобновить оставшееся время до следующего периодического цикла"
+            value_template: >-
+              {{ control_mode != 'sensors' and is_state(periodic_cycle_timer, 'paused')
+                 and is_state_attr(periodic_cycle_timer, 'restore', true) }}
+        sequence:
+          - action: timer.start
+            target:
+              entity_id: "{{ periodic_cycle_timer }}"
+
+  - alias: "Начать периодический цикл независимо от показаний датчиков"
+    choose:
+      - conditions:
+          - condition: template
+            alias: "Периодическое проветривание включено и наступило время нового цикла"
+            value_template: >-
+              {{ control_mode in ['periodic', 'combined']
+                 and is_state_attr(periodic_cycle_timer, 'restore', true)
+                 and (is_state(periodic_cycle_timer, 'idle')
+                      or (is_state(periodic_cycle_timer, 'active')
+                          and as_timestamp(state_attr(periodic_cycle_timer, 'finishes_at'), 0) <= as_timestamp(now()))) }}
+        sequence:
+          - action: timer.start
+            target:
+              entity_id: "{{ periodic_cycle_timer }}"
+            data:
+              duration: "{{ (periodic_interval | float * 60) | int }}"
+          - repeat:
+              for_each: "{{ windows | unique | list }}"
+              sequence:
+                - variables:
+                    current_window: "{{ repeat.item }}"
+                    current_timer: "{{ periodic_timers[repeat.item] }}"
+                - choose:
+                    - conditions:
+                        - condition: template
+                          alias: "Привод и таймер длительности доступны"
+                          value_template: >-
+                            {{ states(current_window) not in ['unknown', 'unavailable']
+                               and states(current_timer) in ['idle', 'active', 'paused']
+                               and is_state_attr(current_timer, 'restore', true)
+                               and not (trigger is defined and trigger.id | default('') == 'startup'
+                                        and (states(current_timer) in ['active', 'paused']
+                                             or states(current_window) in ['open', 'opening', 'closing'])) }}
+                      sequence:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  alias: "Отменить прежний отсчёт закрытия по холоду"
+                                  value_template: >-
+                                    {{ current_window in close_timers
+                                       and states(close_timers[current_window]) in ['active', 'paused'] }}
+                              sequence:
+                                - action: timer.cancel
+                                  target:
+                                    entity_id: "{{ close_timers[current_window] }}"
+                        - action: timer.start
+                          target:
+                            entity_id: "{{ current_timer }}"
+                          data:
+                            duration: "{{ (periodic_open_duration | float * 60) | int }}"
+                        - variables:
+                            armed_timers: "{{ armed_timers + [current_timer] }}"
+                        - action: cover.open_cover
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ current_window }}"
+          - *refresh_temperature_entities
+          - *refresh_readings
+          - *refresh_decision
+          - *publish_status
+
   # Отдельный проход отправляет команды открытия до возможного ожидания
   # закрытия по холоду. Повторные события окна и датчиков не обходят паузу.
   # last_changed меняется при смене состояния, но не при смене атрибутов.
@@ -871,7 +1205,7 @@ actions:
           - condition: template
             alias: "Проветривание при низкой температуре разрешено и воздух требует его"
             value_template: >-
-              {{ allow_cold_ventilation and readings.valid and readings.high
+              {{ control_mode != 'periodic' and allow_cold_ventilation and readings.valid and readings.high
                  and readings.temperature < reopening_temperature | float }}
         sequence:
           - repeat:
@@ -890,17 +1224,35 @@ actions:
                             {{ readings.valid and readings.high and not readings.recovered
                                and readings.temperature < reopening_temperature | float
                                and is_state(current_window, 'closed')
+                               and (current_window not in periodic_timers
+                                    or not is_state(periodic_timers[current_window], 'active'))
+                               and (readings.temperature > minimum_temperature | float or cold_close_delay | float == 0
+                                    or (is_state_attr(close_timers.get(current_window, ''), 'restore', true)
+                                        and states(close_timers.get(current_window, '')) in ['idle', 'active', 'paused']))
                                and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
                                and as_timestamp(now())
                                    - as_timestamp(states[current_window].last_changed, as_timestamp(now()))
                                    >= cold_ventilation_pause | float * 60 }}
                       sequence:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  alias: "Перед открытием запустить отсчёт закрытия по холоду"
+                                  value_template: >-
+                                    {{ cold_close_delay | float > 0
+                                       and readings.temperature <= minimum_temperature | float }}
+                              sequence:
+                                - action: timer.start
+                                  target:
+                                    entity_id: "{{ close_timers[current_window] }}"
+                                  data:
+                                    duration: "{{ (cold_close_delay | float * 60) | int }}"
+                                - variables:
+                                    armed_timers: "{{ armed_timers + [close_timers[current_window]] }}"
                         - action: cover.open_cover
                           continue_on_error: true
                           target:
                             entity_id: "{{ current_window }}"
-                        - variables:
-                            cold_ventilation_started: true
           - *refresh_temperature_entities
           - *refresh_readings
           - *refresh_decision
@@ -969,73 +1321,6 @@ actions:
         data:
           notification_id: "{{ notification_prefix }}_blocked"
 
-  - alias: "Дождаться закрытия по низкой температуре"
-    choose:
-      - conditions:
-          - condition: template
-            alias: "Требуется закрытие по холоду с задержкой"
-            value_template: "{{ window_action == 'close_cold' }}"
-        sequence:
-          # Не создаём таймер на каждое обновление показаний. Первый отсчёт —
-          # при похолодании, запуске HA, ручном открытии окна или ручном запуске.
-          # Раз в 5 минут возможен повтор для восстановления после reload/ошибок;
-          # повтор не отменяет уже запущенный отсчёт.
-          - condition: template
-            alias: "Событие разрешает запуск таймера закрытия по холоду"
-            value_template: >-
-              {{ trigger is not defined
-                 or cold_ventilation_started
-                 or trigger.id | default('') in ['room_cold_or_unavailable', 'startup']
-                 or (trigger.id | default('') == 'periodic_check' and now().minute % 5 == 0)
-                 or (trigger.id | default('') == 'window_changed'
-                     and trigger.to_state is not none
-                     and trigger.to_state.state in ['open', 'opening']) }}
-          - condition: template
-            alias: "Есть открытые или открывающиеся окна"
-            value_template: >-
-              {{ windows | select('is_state', 'open') | list | count > 0
-                 or windows | select('is_state', 'opening') | list | count > 0
-                 or contacts.values() | select('is_state', 'on') | list | count > 0 }}
-          - wait_template: >-
-              {% set ns = namespace(values=[], valid=true) %}
-              {% set sensors = selected_temperature_sensors %}
-              {% if sensors | count == 0 %}
-                {% set sensors = area_entities(selected_area)
-                   | select('match', '^sensor[.]')
-                   | select('is_state_attr', 'device_class', 'temperature') | list %}
-              {% endif %}
-              {% for entity in sensors %}
-                {% set value = states(entity) %}
-                {% set unit = state_attr(entity, 'unit_of_measurement') %}
-                {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
-                  {% set ns.valid = false %}
-                {% else %}
-                  {% set value = value | float %}
-                  {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
-                     else value - 273.15 if unit == 'K' else value %}
-                  {% set ns.values = ns.values + [celsius | round(3)] %}
-                {% endif %}
-              {% endfor %}
-              {{ not ns.valid or ns.values | count == 0
-                 or ns.values | min > minimum_temperature | float }}
-            timeout:
-              minutes: "{{ cold_close_delay | float }}"
-            continue_on_timeout: true
-          # За время ожидания могли измениться показания и состав датчиков.
-          - *refresh_temperature_entities
-          - *refresh_readings
-          - condition: template
-            alias: "После ожидания закрытие всё ещё необходимо"
-            value_template: >-
-              {{ not readings.valid
-                 or (readings.recovered and (normal_position | int == 0
-                     or readings.temperature <= minimum_temperature | float))
-                 or (not wait.completed and readings.temperature <= minimum_temperature | float) }}
-          - variables:
-              window_action: close
-              ventilation_status: "Закрытие: низкая температура после ожидания"
-          - *publish_status
-
   - variables:
       closing_requests: []
 
@@ -1055,21 +1340,150 @@ actions:
         # пока выполнялась команда предыдущему окну.
         - *refresh_temperature_entities
         - *refresh_readings
+        - variables:
+            cold_timer: "{{ close_timers.get(current_window, '') }}"
+            periodic_timer: "{{ periodic_timers.get(current_window, '') }}"
+            confirmed_closed_event: >-
+              {{ is_state(current_window, 'closed') and trigger is defined
+                 and trigger.id | default('') == 'window_changed'
+                 and trigger.entity_id | default('') == current_window }}
+        - choose:
+            - conditions:
+                - condition: template
+                  alias: "Отменить отсчёт периодического цикла при переходе в режим по датчикам"
+                  value_template: >-
+                    {{ control_mode == 'sensors' and periodic_timer | length > 0
+                       and states(periodic_timer) in ['active', 'paused'] }}
+              sequence:
+                - action: timer.cancel
+                  target:
+                    entity_id: "{{ periodic_timer }}"
+        - alias: "Отменить отсчёты закрытого окна и возобновить восстановленные таймеры"
+          repeat:
+            for_each: "{{ [cold_timer, periodic_timer] | reject('equalto', '') | list }}"
+            sequence:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        alias: "Закрытие относится к текущему отсчёту"
+                        value_template: >-
+                          {{ states(repeat.item) in ['active', 'paused']
+                             and is_state(current_window, 'closed')
+                             and ((trigger is defined and trigger.id | default('') == 'startup'
+                                   and repeat.item not in armed_timers)
+                                  or (confirmed_closed_event
+                                      and as_timestamp(trigger.to_state.last_changed | default(none), 0)
+                                          >= as_timestamp(states[repeat.item].last_changed, 0))) }}
+                    sequence:
+                      - action: timer.cancel
+                        target:
+                          entity_id: "{{ repeat.item }}"
+                  - conditions:
+                      - condition: template
+                        alias: "Продолжить отсчёт, не меняя оставшееся время"
+                        value_template: "{{ is_state(repeat.item, 'paused') }}"
+                    sequence:
+                      - action: timer.start
+                        target:
+                          entity_id: "{{ repeat.item }}"
+        - alias: "Поддерживать один отсчёт закрытия по холоду для этого окна"
+          choose:
+            - conditions:
+                - condition: template
+                  alias: "Для окна настроен таймер закрытия по холоду"
+                  value_template: "{{ cold_timer | length > 0 }}"
+              sequence:
+                - choose:
+                    - conditions:
+                        - condition: template
+                          alias: "Закрытие по холоду больше не требуется"
+                          value_template: >-
+                            {{ control_mode == 'periodic' or not readings.valid or readings.recovered
+                               or readings.temperature > minimum_temperature | float
+                               or (periodic_timer | length > 0 and is_state(periodic_timer, 'active'))
+                               or states(current_window) in ['unknown', 'unavailable'] }}
+                      sequence:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  alias: "Отменить действующий отсчёт без события завершения"
+                                  value_template: "{{ states(cold_timer) in ['active', 'paused'] }}"
+                              sequence:
+                                - action: timer.cancel
+                                  target:
+                                    entity_id: "{{ cold_timer }}"
+                    - conditions:
+                        - condition: template
+                          alias: "Начать отсчёт при похолодании или открытии, не перезапуская активный"
+                          value_template: >-
+                            {{ cold_close_delay | float > 0 and is_state(cold_timer, 'idle')
+                               and is_state_attr(cold_timer, 'restore', true)
+                               and (states(current_window) in ['open', 'opening']
+                                    or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
+                                        and is_state(current_window, 'closed')))
+                               and (trigger is not defined
+                                    or trigger.id | default('') == 'room_cold_or_unavailable'
+                                    or (trigger.id | default('') == 'window_changed'
+                                        and trigger.entity_id | default('') == current_window
+                                        and trigger.from_state is defined and trigger.from_state is not none
+                                        and trigger.from_state.state in ['closed', 'closing']
+                                        and trigger.to_state.state in ['open', 'opening'])) }}
+                      sequence:
+                        - action: timer.start
+                          target:
+                            entity_id: "{{ cold_timer }}"
+                          data:
+                            duration: "{{ (cold_close_delay | float * 60) | int }}"
         - &refresh_window_requirements
           variables:
+            cold_timer: "{{ close_timers.get(current_window, '') }}"
+            periodic_timer: "{{ periodic_timers.get(current_window, '') }}"
+            periodic_active: >-
+              {{ control_mode != 'sensors' and periodic_timer | length > 0
+                 and is_state_attr(periodic_timer, 'restore', true)
+                 and is_state(periodic_timer, 'active')
+                 and as_timestamp(state_attr(periodic_timer, 'finishes_at'), 0) > as_timestamp(now()) }}
+            periodic_close_due: >-
+              {{ control_mode != 'sensors' and not periodic_active
+                 and (control_mode == 'periodic'
+                      or (periodic_timer | length > 0 and is_state(periodic_timer, 'active'))
+                      or (trigger is defined and trigger.id | default('') == 'startup')
+                      or (trigger is defined and trigger.id | default('') == 'timer_finished'
+                          and trigger.event.data.get('entity_id', '') == periodic_timer
+                          and as_timestamp(trigger.event.data.get('finished_at'), 0)
+                              >= as_timestamp(states[current_window].last_changed, 0)))
+                 and not (verification_in_progress | default(false) and control_mode == 'combined'
+                          and readings.valid and readings.high
+                          and readings.temperature >= reopening_temperature | float
+                          and states(current_window) in ['open', 'opening']) }}
             current_position: "{{ state_attr(current_window, 'current_position') }}"
             position_available: >-
               {{ state_attr(current_window, 'supported_features') | int(0) | bitwise_and(4) != 0
                  and is_number(current_position) and 0 <= current_position | float <= 100 }}
             full_close_required: >-
-              {{ not readings.valid or readings.temperature <= minimum_temperature | float
-                 or (readings.recovered and (normal_position | int == 0 or not position_available)) }}
+              {{ not periodic_active and (periodic_close_due
+                 or (control_mode != 'periodic' and (
+                      not readings.valid
+                      or (readings.recovered and (normal_position | int == 0 or not position_available))
+                      or (readings.temperature <= minimum_temperature | float
+                          and (cold_close_delay | float == 0
+                               or cold_timer | length == 0
+                               or not is_state_attr(cold_timer, 'restore', true)
+                               or states(cold_timer) in ['unknown', 'unavailable']
+                               or (is_state(cold_timer, 'idle') and trigger is defined
+                                   and (trigger.id | default('') in ['startup', 'periodic_check']
+                                        or (trigger.id | default('') == 'timer_finished'
+                                            and trigger.event.data.get('entity_id', '') == cold_timer
+                                            and as_timestamp(trigger.event.data.get('finished_at'), 0)
+                                                >= as_timestamp(states[current_window].last_changed, 0))))
+                               or (is_state(cold_timer, 'active')
+                                   and as_timestamp(state_attr(cold_timer, 'finishes_at'), 0) <= as_timestamp(now()))))))) }}
         - choose:
             - conditions:
                 - condition: template
                   alias: "Окно нужно закрыть по актуальным показаниям"
                   value_template: >-
-                    {{ window_action in ['close', 'position'] and full_close_required
+                    {{ full_close_required
                        and (states(current_window) in ['open', 'opening']
                             or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
                                 and states(current_window) not in ['unknown', 'unavailable']
@@ -1078,6 +1492,18 @@ actions:
                                     and trigger.entity_id | default('') == current_window
                                     and states(current_window) in ['closed', 'closing']))) }}
               sequence:
+                - repeat:
+                    for_each: "{{ [cold_timer, periodic_timer] | reject('equalto', '') | list }}"
+                    sequence:
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                alias: "Отменить таймер перед полным закрытием окна"
+                                value_template: "{{ states(repeat.item) in ['active', 'paused'] }}"
+                            sequence:
+                              - action: timer.cancel
+                                target:
+                                  entity_id: "{{ repeat.item }}"
                 - action: cover.close_cover
                   continue_on_error: true
                   target:
@@ -1095,7 +1521,8 @@ actions:
                 - condition: template
                   alias: "Воздух в норме и можно установить заданное положение окна"
                   value_template: >-
-                    {{ window_action == 'position' and readings.valid and readings.recovered
+                    {{ control_mode != 'periodic' and not periodic_active and not periodic_close_due
+                       and window_action == 'position' and readings.valid and readings.recovered
                        and readings.temperature > minimum_temperature | float
                        and position_available and states(current_window) in ['open', 'closed']
                        and current_position | float != normal_position | int
@@ -1112,7 +1539,8 @@ actions:
                 - condition: template
                   alias: "Воздух требует проветривания и температура разрешает открытие"
                   value_template: >-
-                    {{ window_action == 'open'
+                    {{ control_mode != 'periodic' and not periodic_active and not periodic_close_due
+                       and window_action == 'open'
                        and readings.valid and readings.high and not readings.recovered
                        and readings.temperature >= reopening_temperature | float
                        and (states(current_window) in ['closed', 'closing']
@@ -1144,6 +1572,7 @@ actions:
       for_each: "{{ closing_requests }}"
       sequence:
         - variables:
+            verification_in_progress: true
             current_window: "{{ repeat.item }}"
             contact_sensor: "{{ contacts[current_window] }}"
         - wait_template: "{{ is_state(contact_sensor, 'off') }}"

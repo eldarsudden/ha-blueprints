@@ -109,6 +109,55 @@ blueprint:
               unit_of_measurement: "%"
               mode: slider
 
+    opening_section:
+      name: "Уровень открытия при проветривании"
+      icon: mdi:window-shutter-open
+      collapsed: false
+      input:
+        sensor_opening_entity:
+          name: "Сущность открытия по датчикам (опционально)"
+          description: >-
+            Number-сущность привода выбранного окна или группы: получает
+            процент командой number.set_value. Без выбора — полное открытие
+            через cover. Закрытие всегда выполняется через выбранные cover.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: number
+        sensor_opening_percentage:
+          name: "Открытие по датчикам"
+          description: "Процент для выбранной выше number-сущности."
+          default: 100
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+        periodic_opening_entity:
+          name: "Сущность открытия по расписанию (опционально)"
+          description: >-
+            Number-сущность привода: получает процент командой number.set_value
+            во время интервала cron. Без выбора — полное открытие через cover.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: number
+        periodic_opening_percentage:
+          name: "Открытие по расписанию"
+          description: "Процент для выбранной выше number-сущности."
+          default: 100
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: "%"
+              mode: slider
+
     co2_section:
       name: "CO₂"
       icon: mdi:molecule-co2
@@ -325,6 +374,73 @@ blueprint:
             Число дополнительных команд за одну проверку после первоначальной.
             0 = только дождаться датчика и сообщить о неудаче.
             При недоступном контактном датчике дополнительные команды не отправляются.
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 5
+              step: 1
+              mode: box
+
+    reboot_section:
+      name: "Повтор команды после Reboot"
+      icon: mdi:restart-alert
+      collapsed: true
+      input:
+        window_last_events:
+          name: "Датчики Last event (опционально)"
+          description: >-
+            Выберите датчик последнего события привода. При одном окне поле
+            «Окно» можно пропустить. Повторяется только команда, после которой
+            появилось новое событие Reboot; остальные ошибки не запускают повторы.
+            Одинаковые повторные события должны обновлять состояние датчика.
+          default: []
+          selector:
+            object:
+              multiple: true
+              label_field: sensor
+              description_field: window
+              fields:
+                window:
+                  label: "Окно (необязательно для одного окна)"
+                  required: false
+                  selector:
+                    entity:
+                      filter:
+                        - domain: cover
+                sensor:
+                  label: "Last event"
+                  required: true
+                  selector:
+                    entity:
+                      filter:
+                        - domain: sensor
+        reboot_detection_timeout:
+          name: "Ожидание события Reboot после команды"
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 60
+              step: 1
+              unit_of_measurement: "сек"
+              mode: box
+        reboot_retry_delay:
+          name: "Пауза после Reboot"
+          description: >-
+            Перед повтором выдерживает паузу и ждёт доступности привода
+            ещё не более этого времени. Показания и расписание проверяются заново.
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 120
+              step: 1
+              unit_of_measurement: "сек"
+              mode: box
+        reboot_retry_count:
+          name: "Повторы после Reboot"
+          description: "Дополнительные попытки для каждого окна за один запуск. 0 = выключено."
           default: 2
           selector:
             number:
@@ -661,6 +777,10 @@ actions:
       control_mode: !input control_mode
       periodic_schedule: !input periodic_schedule
       periodic_open_duration: !input periodic_open_duration
+      sensor_opening_entity: !input sensor_opening_entity
+      sensor_opening_percentage: !input sensor_opening_percentage
+      periodic_opening_entity: !input periodic_opening_entity
+      periodic_opening_percentage: !input periodic_opening_percentage
       selected_area: !input room_area
       windows: !input window_entities
       co2_entities: !input co2_sensors
@@ -678,6 +798,29 @@ actions:
       normal_position: !input air_recovered_position
       contact_pairs: !input window_contacts
       contacts: *normalize_contacts
+      last_event_pairs: !input window_last_events
+      reboot_watch: !input reboot_detection_timeout
+      reboot_delay: !input reboot_retry_delay
+      reboot_retries: !input reboot_retry_count
+      event_sensors: >-
+        {% set ns = namespace(items=[], valid=last_event_pairs is sequence and last_event_pairs is not string) %}
+        {% if ns.valid %}
+          {% for pair in last_event_pairs %}
+            {% if pair is not mapping %}
+              {% set ns.valid = false %}
+            {% else %}
+              {% set window = pair.get('window') or (windows[0] if windows | count == 1 else '') %}
+              {% set sensor = pair.get('sensor') %}
+              {% if window not in windows or sensor is not string or not sensor.startswith('sensor.') %}
+                {% set ns.valid = false %}
+              {% else %}
+                {% set ns.items = ns.items + [(window, sensor)] %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+        {% set mapped = dict(ns.items) %}
+        {{ mapped if ns.valid and mapped | count == ns.items | count else none }}
       confirmation_timeout: !input close_confirmation_timeout
       retry_count: !input close_retry_count
       status_entity: !input status_entity
@@ -688,6 +831,11 @@ actions:
       cold_wait_expired: {}
       closing_cycles: {}
       scheduled_close_windows: []
+      opening_commands_sent: []
+      reboot_commands: []
+      reboot_processed: 0
+      reboot_attempts: {}
+      reboot_recovery_in_progress: false
       notification_prefix: "air_ventilation_{{ this.entity_id | replace('.', '_') }}"
 
   - variables:
@@ -745,8 +893,22 @@ actions:
 
   - variables:
       configuration_valid: >-
-        {% set ns = namespace(valid=contacts is mapping
+        {% set ns = namespace(valid=contacts is mapping and event_sensors is mapping
+           and is_number(reboot_watch) and 1 <= reboot_watch | float <= 60
+           and is_number(reboot_delay) and 1 <= reboot_delay | float <= 120
+           and is_number(reboot_retries) and 0 <= reboot_retries | float <= 5
+           and reboot_retries | float == reboot_retries | int
            and control_mode in ['sensors', 'periodic', 'combined']) %}
+        {% set outputs = ([(sensor_opening_entity, sensor_opening_percentage)] if control_mode != 'periodic' else [])
+           + ([(periodic_opening_entity, periodic_opening_percentage)] if control_mode != 'sensors' else []) %}
+        {% for entity, percentage in outputs %}
+          {% if entity is not string or (entity | length > 0
+             and (not entity.startswith('number.') or not is_number(percentage)
+                  or not 1 <= percentage | float <= 100
+                  or percentage | float != percentage | int)) %}
+            {% set ns.valid = false %}
+          {% endif %}
+        {% endfor %}
         {% if contacts is mapping %}
           {% for window, sensor in contacts.items() %}
             {% if window not in windows or sensor is not string
@@ -780,7 +942,7 @@ actions:
             value_template: "{{ not configuration_valid }}"
         sequence:
           - variables:
-              ventilation_status: "Ошибка настроек: проверьте режим, датчики, пороги, контакты и расписание cron"
+              ventilation_status: "Ошибка настроек: проверьте режим, датчики, приводы, пороги и расписание cron"
           - &publish_status
             alias: "Обновить текстовый статус"
             choose:
@@ -816,6 +978,18 @@ actions:
     alias: "Выбраны датчики и заданы корректные пороги и контакты"
     value_template: "{{ configuration_valid }}"
 
+  - condition: template
+    alias: "Возвращение привода в сеть обрабатывает ожидающий запуск"
+    value_template: >-
+      {% set sensor = event_sensors.get(trigger.entity_id | default(''), '') if trigger is defined else '' %}
+      {{ not (reboot_retries | int > 0 and sensor | length > 0 and trigger is defined
+           and trigger.id | default('') == 'window_changed'
+           and trigger.from_state is defined and trigger.from_state is not none
+           and trigger.from_state.state in ['unknown', 'unavailable']
+           and states(sensor) | lower == 'reboot'
+           and as_timestamp(now()) - as_timestamp(states[sensor].last_changed, 0) < reboot_delay | float * 2 + reboot_watch | float + 5
+           and state_attr(this.entity_id, 'current') | int(0) > 1) }}
+
   # Ищем последнее совпадение cron в пределах длительности и одного шага
   # проверки. Состояние интервала восстанавливается из календаря без хранения.
   - &refresh_schedule
@@ -845,6 +1019,20 @@ actions:
         {{ dict(active=elapsed is not none and 0 <= elapsed < duration,
                 closing_due=elapsed is not none and 0 <= elapsed - duration < 30,
                 started_at=ns.start, ends_at=ns.start + duration if ns.start is not none else none) }}
+      opening_entity: >-
+        {{ periodic_opening_entity if control_mode == 'periodic' or schedule_state.active
+           else sensor_opening_entity }}
+      opening_percentage: >-
+        {{ (periodic_opening_percentage if control_mode == 'periodic' or schedule_state.active
+            else sensor_opening_percentage) | int }}
+      opening_command_available: >-
+        {{ opening_entity | length == 0
+           or (is_number(states(opening_entity))
+               and state_attr(opening_entity, 'min') | float(0) <= opening_percentage
+               and opening_percentage <= state_attr(opening_entity, 'max') | float(100)) }}
+      opening_level_matches: >-
+        {{ opening_entity | length > 0 and is_number(states(opening_entity))
+           and states(opening_entity) | float == opening_percentage }}
 
   - &refresh_temperature_entities
     variables:
@@ -923,7 +1111,11 @@ actions:
             {% set unconfirmed.found = true %}
           {% endif %}
         {% endfor %}
-        {% if schedule_state.active %}
+        {% if not opening_command_available and (schedule_state.active
+           or (control_mode != 'periodic' and readings.valid and readings.high and not readings.recovered
+               and (readings.temperature >= reopening_temperature | float or allow_cold_ventilation))) %}
+          Открытие недоступно: проверьте {{ opening_entity }} и допустимость {{ opening_percentage }}%
+        {% elif schedule_state.active %}
           Проветривание по расписанию {{ periodic_schedule }}: {{ periodic_open_duration }} мин независимо от датчиков
         {% elif control_mode == 'periodic' %}
           Ожидание расписания {{ periodic_schedule }}
@@ -1017,12 +1209,14 @@ actions:
                     contact_sensor: "{{ contacts.get(repeat.item, '') }}"
                 - *refresh_temperature_entities
                 - *refresh_readings
+                - *refresh_schedule
                 - choose:
                     - conditions:
                         - condition: template
                           alias: "Окно закрыто, пауза прошла и показания разрешают проветривание"
                           value_template: >-
-                            {{ readings.valid and readings.high and not readings.recovered
+                            {{ not schedule_state.active and opening_command_available
+                               and readings.valid and readings.high and not readings.recovered
                                and readings.temperature < reopening_temperature | float
                                and is_state(current_window, 'closed')
                                and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
@@ -1032,10 +1226,61 @@ actions:
                       sequence:
                         - variables:
                             cold_opened_windows: "{{ cold_opened_windows + [current_window] }}"
-                        - action: cover.open_cover
-                          continue_on_error: true
-                          target:
-                            entity_id: "{{ current_window }}"
+                        - &open_ventilation_window
+                          choose:
+                            - conditions:
+                                - condition: template
+                                  alias: "Открыть через number-сущность привода"
+                                  value_template: >-
+                                    {{ opening_entity | length > 0 and opening_command_available
+                                       and [opening_entity, opening_percentage] not in opening_commands_sent }}
+                              sequence:
+                                - variables:
+                                    motor_command: "{{ dict(service='number.set_value', entity=opening_entity, data=dict(value=opening_percentage), kind='open') }}"
+                                - &prepare_motor_command
+                                  variables:
+                                    command_event_sensor: >-
+                                      {% set sensors = event_sensors.values() | unique | list %}
+                                      {{ event_sensors.get(current_window, '')
+                                         or (sensors[0] if motor_command.service == 'number.set_value'
+                                             and sensors | count == 1 else '') }}
+                                    command_started_at: "{{ as_timestamp(now()) }}"
+                                    command_report_before: >-
+                                      {% set sensor = command_event_sensor %}
+                                      {{ as_timestamp(states[sensor].last_changed, 0)
+                                         if sensor | length > 0 and states(sensor) != 'unknown' else 0 }}
+                                - action: number.set_value
+                                  continue_on_error: true
+                                  target:
+                                    entity_id: "{{ opening_entity }}"
+                                  data:
+                                    value: "{{ opening_percentage }}"
+                                - &remember_motor_command
+                                  variables:
+                                    reboot_commands: >-
+                                      {% set sensor = command_event_sensor %}
+                                      {{ reboot_commands + [dict(motor_command, window=current_window, sensor=sensor,
+                                           sent_at=command_started_at, report_before=command_report_before,
+                                           phase='periodic' if schedule_state.active else 'sensors',
+                                           schedule_start=schedule_state.started_at,
+                                           schedule_close=periodic_close_due | default(false),
+                                           cold_expired=current_window in cold_wait_expired)]
+                                         if sensor | length > 0 and reboot_retries | int > 0 else reboot_commands }}
+                                - variables:
+                                    opening_commands_sent: "{{ opening_commands_sent + [[opening_entity, opening_percentage]] }}"
+                            - conditions:
+                                - condition: template
+                                  alias: "Открыть через cover без отдельной number-сущности"
+                                  value_template: "{{ opening_entity | length == 0 }}"
+                              sequence:
+                                - variables:
+                                    motor_command: "{{ dict(service='cover.open_cover', entity=current_window, data={}, kind='open') }}"
+                                - *prepare_motor_command
+                                - action: cover.open_cover
+                                  continue_on_error: true
+                                  target:
+                                    entity_id: "{{ current_window }}"
+                                - *remember_motor_command
           - *refresh_temperature_entities
           - *refresh_readings
           - *refresh_schedule
@@ -1135,10 +1380,11 @@ actions:
             periodic_close_due: >-
               {{ control_mode != 'sensors' and not periodic_active
                  and (control_mode == 'periodic'
-                      or (verification_in_progress | default(false) and current_window in scheduled_close_windows)
+                      or ((verification_in_progress | default(false) or reboot_recovery_in_progress)
+                          and current_window in scheduled_close_windows)
                       or (schedule_state.closing_due and trigger is defined
                           and trigger.id | default('') in ['periodic_check', 'schedule_check']))
-                 and not (verification_in_progress | default(false)
+                 and not (verification_in_progress | default(false) and not reboot_recovery_in_progress
                           and current_window in closing_cycles
                           and states(current_window) in ['open', 'opening']
                           and as_timestamp(states[current_window].last_changed, 0) != closing_cycles[current_window]) }}
@@ -1155,7 +1401,7 @@ actions:
                       or (readings.temperature <= minimum_temperature | float
                           and (cold_close_delay | float == 0
                                or (current_window in cold_wait_expired
-                                   and (states(current_window) in ['closed', 'closing']
+                                   and (reboot_recovery_in_progress or states(current_window) in ['closed', 'closing']
                                         or as_timestamp(states[current_window].last_changed, 0)
                                            == cold_wait_expired[current_window]))))))) }}
         - &dispatch_window_command
@@ -1180,10 +1426,14 @@ actions:
                     scheduled_close_windows: >-
                       {{ scheduled_close_windows + [current_window]
                          if periodic_close_due else scheduled_close_windows }}
+                - variables:
+                    motor_command: "{{ dict(service='cover.close_cover', entity=current_window, data={}, kind='close') }}"
+                - *prepare_motor_command
                 - action: cover.close_cover
                   continue_on_error: true
                   target:
                     entity_id: "{{ current_window }}"
+                - *remember_motor_command
                 - alias: "Добавить окно в список проверки закрытия"
                   choose:
                     - conditions:
@@ -1197,10 +1447,12 @@ actions:
                 - condition: template
                   alias: "Открыть окно в текущем интервале расписания"
                   value_template: >-
-                    {{ periodic_active
+                    {{ periodic_active and opening_command_available
                        and (states(current_window) in ['closed', 'closing']
-                            or (is_state(current_window, 'open') and position_available
-                                and current_position | float < 100))
+                            or (is_state(current_window, 'open')
+                                and ((opening_entity | length > 0 and not opening_level_matches)
+                                     or (opening_entity | length == 0 and position_available
+                                         and current_position | float < 100))))
                        and (states(current_window) not in ['closed', 'closing']
                             or (trigger is defined and trigger.id | default('') == 'startup')
                             or as_timestamp(states[current_window].last_changed, 0) <= schedule_state.started_at)
@@ -1208,10 +1460,7 @@ actions:
                                 and trigger.entity_id | default('') == current_window
                                 and states(current_window) in ['closed', 'closing']) }}
               sequence:
-                - action: cover.open_cover
-                  continue_on_error: true
-                  target:
-                    entity_id: "{{ current_window }}"
+                - *open_ventilation_window
             - conditions:
                 - condition: template
                   alias: "Воздух в норме и можно установить заданное положение окна"
@@ -1224,28 +1473,31 @@ actions:
                        and (current_position | float > normal_position | int
                             or readings.temperature >= reopening_temperature | float) }}
               sequence:
+                - variables:
+                    motor_command: "{{ dict(service='cover.set_cover_position', entity=current_window, data=dict(position=normal_position | int), kind='position') }}"
+                - *prepare_motor_command
                 - action: cover.set_cover_position
                   continue_on_error: true
                   target:
                     entity_id: "{{ current_window }}"
                   data:
                     position: "{{ normal_position | int }}"
+                - *remember_motor_command
             - conditions:
                 - condition: template
                   alias: "Воздух требует проветривания и температура разрешает открытие"
                   value_template: >-
                     {{ control_mode != 'periodic' and not periodic_active and not periodic_close_due
-                       and window_action == 'open'
+                       and opening_command_available and window_action == 'open'
                        and readings.valid and readings.high and not readings.recovered
                        and readings.temperature >= reopening_temperature | float
                        and (states(current_window) in ['closed', 'closing']
-                            or (normal_position | int > 0 and is_state(current_window, 'open')
-                                and is_number(current_position) and current_position | float < 100)) }}
+                            or (is_state(current_window, 'open')
+                                and ((opening_entity | length > 0 and not opening_level_matches)
+                                     or (opening_entity | length == 0 and normal_position | int > 0
+                                         and is_number(current_position) and current_position | float < 100)))) }}
               sequence:
-                - action: cover.open_cover
-                  continue_on_error: true
-                  target:
-                    entity_id: "{{ current_window }}"
+                - *open_ventilation_window
 
         - alias: "Удалить уведомление после закрытия или перехода к приоткрытию"
           choose:
@@ -1260,6 +1512,173 @@ actions:
                   continue_on_error: true
                   data:
                     notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"
+
+  # Первоначальные команды уже отправлены всем окнам. Каждый новый Reboot
+  # проверяется относительно конкретной попытки; повтор не создаёт новую очередь.
+  - &recover_rebooted_commands
+    alias: "Повторить потерянные при Reboot команды"
+    repeat:
+      for_each: "{{ reboot_commands[reboot_processed:] }}"
+      sequence:
+        - variables:
+            reboot_processed: "{{ reboot_processed + 1 }}"
+            recovery_command: "{{ repeat.item }}"
+            current_window: "{{ repeat.item.window }}"
+            contact_sensor: "{{ contacts.get(repeat.item.window, '') }}"
+            recovery_sensor: "{{ repeat.item.sensor }}"
+            recovery_sent_at: "{{ repeat.item.sent_at }}"
+            recovery_report_before: "{{ repeat.item.report_before }}"
+            recovery_done: false
+            reboot_recovery_in_progress: true
+        - repeat:
+            count: "{{ reboot_retries | int + 1 }}"
+            sequence:
+              - condition: template
+                alias: "Проверка этой команды ещё не завершена"
+                value_template: "{{ not recovery_done }}"
+              - wait_template: &new_reboot_event >-
+                  {{ states(recovery_sensor) | lower == 'reboot'
+                     and as_timestamp(states[recovery_sensor].last_changed, 0) > recovery_report_before
+                     and recovery_sent_at <= as_timestamp(states[recovery_sensor].last_changed, 0)
+                         <= recovery_sent_at + reboot_watch | float }}
+                timeout:
+                  seconds: "{{ [0, recovery_sent_at + reboot_watch | float - as_timestamp(now())] | max }}"
+                continue_on_timeout: true
+              - choose:
+                  - conditions:
+                      - condition: template
+                        alias: "После этой попытки зарегистрирован новый Reboot"
+                        value_template: *new_reboot_event
+                    sequence:
+                      - variables:
+                          recovery_attempt: "{{ repeat.index }}"
+                          ventilation_status: "Перезапуск {{ current_window }}: ожидание повторной команды"
+                      - *publish_status
+                      - delay:
+                          seconds: "{{ reboot_delay | float }}"
+                      - wait_template: >-
+                          {{ states(current_window) not in ['unknown', 'unavailable']
+                             and (recovery_command.service != 'number.set_value'
+                                  or (is_number(states(recovery_command.entity))
+                                      and state_attr(recovery_command.entity, 'min') | float(0) <= recovery_command.data.value
+                                      and recovery_command.data.value <= state_attr(recovery_command.entity, 'max') | float(100))) }}
+                        timeout:
+                          seconds: "{{ reboot_delay | float }}"
+                        continue_on_timeout: true
+                      - variables:
+                          recovery_ready: "{{ wait.completed }}"
+                      - *refresh_temperature_entities
+                      - *refresh_readings
+                      - *refresh_schedule
+                      - *refresh_window_requirements
+                      - variables:
+                          recovery_fault: "{{ states(recovery_sensor) | lower | replace(' ', '_') }}"
+                          recovery_blocked_by_fault: >-
+                            {{ recovery_fault in ['high_wind', 'low_battery', 'current_overload',
+                               'opening_failed', 'closing_failed', 'external_opening'] }}
+                          recovery_needed: >-
+                            {% if recovery_blocked_by_fault %}
+                              {{ false }}
+                            {% elif recovery_command.kind == 'close' %}
+                              {{ full_close_required and (contact_sensor | length == 0
+                                 or not is_state(contact_sensor, 'off')) }}
+                            {% elif recovery_command.kind == 'position' %}
+                              {{ not schedule_state.active and control_mode != 'periodic'
+                                 and readings.valid and readings.recovered
+                                 and (not recovery_ready or position_available)
+                                 and readings.temperature > minimum_temperature | float
+                                 and normal_position | int == recovery_command.data.position
+                                 and (not is_number(current_position)
+                                      or current_position | float >= normal_position | int
+                                      or readings.temperature >= reopening_temperature | float) }}
+                            {% else %}
+                              {% set phase_matches = schedule_state.active
+                                 and schedule_state.started_at == recovery_command.schedule_start
+                                 if recovery_command.phase == 'periodic'
+                                 else not schedule_state.active and control_mode != 'periodic' %}
+                              {% set target_matches = (opening_entity == recovery_command.entity
+                                 and opening_percentage == recovery_command.data.get('value'))
+                                 if recovery_command.service == 'number.set_value'
+                                 else opening_entity | length == 0 %}
+                              {{ phase_matches and target_matches and not full_close_required
+                                 and (schedule_state.active or (readings.valid and readings.high and not readings.recovered
+                                      and (readings.temperature >= reopening_temperature | float or allow_cold_ventilation)
+                                      and (readings.temperature > minimum_temperature | float or cold_close_delay | float > 0))) }}
+                            {% endif %}
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                alias: "После Reboot привод сообщил другую причину остановки"
+                                value_template: "{{ recovery_blocked_by_fault }}"
+                            sequence:
+                              - variables:
+                                  recovery_done: true
+                                  ventilation_status: "Повтор отменён для {{ current_window }}: {{ states(recovery_sensor) }}"
+                              - *publish_status
+                          - conditions:
+                              - condition: template
+                                alias: "Условия изменились — отменить старую команду"
+                                value_template: "{{ not recovery_needed }}"
+                            sequence:
+                              - variables:
+                                  recovery_done: true
+                              - *refresh_decision
+                              - *publish_status
+                              - action: persistent_notification.dismiss
+                                continue_on_error: true
+                                data:
+                                  notification_id: "{{ notification_prefix }}_reboot_{{ current_window | replace('.', '_') }}"
+                              - choose:
+                                  - conditions:
+                                      - condition: template
+                                        alias: "После отмены открытия требуется закрытие"
+                                        value_template: "{{ recovery_command.kind != 'close' and full_close_required }}"
+                                    sequence:
+                                      - *dispatch_window_command
+                          - conditions:
+                              - condition: template
+                                alias: "Привод восстановился и разрешена ещё одна попытка"
+                                value_template: "{{ recovery_ready and reboot_attempts.get(current_window, 0) < reboot_retries | int }}"
+                            sequence:
+                              - variables:
+                                  recovery_sent_at: "{{ as_timestamp(now()) }}"
+                                  recovery_report_before: "{{ as_timestamp(states[recovery_sensor].last_changed, 0) }}"
+                                  reboot_attempts: >-
+                                    {{ dict(reboot_attempts.items() | list
+                                         + [(current_window, reboot_attempts.get(current_window, 0) + 1)]) }}
+                              - action: "{{ recovery_command.service }}"
+                                continue_on_error: true
+                                target:
+                                  entity_id: "{{ recovery_command.entity }}"
+                                data: "{{ recovery_command.data }}"
+                        default:
+                          - variables:
+                              recovery_done: true
+                              ventilation_status: "Команда не выполнена после Reboot: {{ current_window }}"
+                          - *publish_status
+                          - choose:
+                              - conditions:
+                                  - condition: template
+                                    value_template: "{{ notifications_enabled }}"
+                                sequence:
+                                  - action: persistent_notification.create
+                                    continue_on_error: true
+                                    data:
+                                      notification_id: "{{ notification_prefix }}_reboot_{{ current_window | replace('.', '_') }}"
+                                      title: "Проветривание: команда потеряна при Reboot"
+                                      message: >-
+                                        {{ current_window }}: {{ recovery_command.service }}.
+                                        Повтор не выполнен: привод недоступен или исчерпан лимит
+                                        {{ reboot_retries }}. Last event: {{ states(recovery_sensor) }}.
+                default:
+                  - variables:
+                      recovery_done: true
+                  - action: persistent_notification.dismiss
+                    continue_on_error: true
+                    data:
+                      notification_id: "{{ notification_prefix }}_reboot_{{ current_window | replace('.', '_') }}"
+        - variables:
+            reboot_recovery_in_progress: false
 
   # Запоминаем состояние каждого окна перед ожиданием закрытия по холоду:
   # ожидание предыдущего открытия не должно закрыть следующий цикл.
@@ -1357,6 +1776,8 @@ actions:
                 - *refresh_window_requirements
                 - *dispatch_window_command
 
+  - *recover_rebooted_commands
+
   # Сначала команды отправлены всем окнам, затем проверяем контакты.
   # Ожидание одного датчика не задерживает первоначальное закрытие остальных.
   - repeat:
@@ -1387,10 +1808,15 @@ actions:
                              and states(current_window) not in ['unknown', 'unavailable']
                              and full_close_required }}
                     sequence:
+                      - variables:
+                          motor_command: "{{ dict(service='cover.close_cover', entity=current_window, data={}, kind='close') }}"
+                      - *prepare_motor_command
                       - action: cover.close_cover
                         continue_on_error: true
                         target:
                           entity_id: "{{ current_window }}"
+                      - *remember_motor_command
+                      - *recover_rebooted_commands
                       - wait_template: "{{ is_state(contact_sensor, 'off') }}"
                         timeout:
                           seconds: "{{ confirmation_timeout | float }}"

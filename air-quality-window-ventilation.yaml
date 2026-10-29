@@ -115,19 +115,20 @@ blueprint:
       collapsed: false
       input:
         sensor_opening_entity:
-          name: "Сущность открытия по датчикам (опционально)"
+          name: "Лимит открытия по датчикам (опционально)"
           description: >-
-            Number-сущность привода выбранного окна или группы: получает
-            процент командой number.set_value. Без выбора — полное открытие
-            через cover. Закрытие всегда выполняется через выбранные cover.
+            Number-сущность ограничения открытия выбранного окна или группы
+            (например, Opening limit). Сначала задаётся лимит, затем отправляется
+            команда открытия через cover. Без выбора — открытие с текущим
+            лимитом привода. Закрытие выполняется через cover.
           default: ""
           selector:
             entity:
               filter:
                 - domain: number
         sensor_opening_percentage:
-          name: "Открытие по датчикам"
-          description: "Процент для выбранной выше number-сущности."
+          name: "Максимальное открытие по датчикам"
+          description: "Лимит в процентах для выбранной выше number-сущности."
           default: 100
           selector:
             number:
@@ -137,18 +138,20 @@ blueprint:
               unit_of_measurement: "%"
               mode: slider
         periodic_opening_entity:
-          name: "Сущность открытия по расписанию (опционально)"
+          name: "Лимит открытия по расписанию (опционально)"
           description: >-
-            Number-сущность привода: получает процент командой number.set_value
-            во время интервала cron. Без выбора — полное открытие через cover.
+            Number-сущность ограничения открытия (например, Opening limit).
+            Во время интервала cron сначала задаётся лимит, затем отправляется
+            команда открытия через cover. Без выбора — открытие с текущим
+            лимитом привода.
           default: ""
           selector:
             entity:
               filter:
                 - domain: number
         periodic_opening_percentage:
-          name: "Открытие по расписанию"
-          description: "Процент для выбранной выше number-сущности."
+          name: "Максимальное открытие по расписанию"
+          description: "Лимит в процентах для выбранной выше number-сущности."
           default: 100
           selector:
             number:
@@ -1120,24 +1123,25 @@ actions:
                           choose:
                             - conditions:
                                 - condition: template
-                                  alias: "Открыть через number-сущность привода"
-                                  value_template: >-
-                                    {{ opening_entity | length > 0 and opening_command_available
-                                       and [opening_entity, opening_percentage] not in opening_commands_sent }}
+                                  alias: "Ограничение открытия доступно или не задано"
+                                  value_template: "{{ opening_command_available }}"
                               sequence:
-                                - action: number.set_value
-                                  continue_on_error: true
-                                  target:
-                                    entity_id: "{{ opening_entity }}"
-                                  data:
-                                    value: "{{ opening_percentage }}"
-                                - variables:
-                                    opening_commands_sent: "{{ opening_commands_sent + [[opening_entity, opening_percentage]] }}"
-                            - conditions:
-                                - condition: template
-                                  alias: "Открыть через cover без отдельной number-сущности"
-                                  value_template: "{{ opening_entity | length == 0 }}"
-                              sequence:
+                                - choose:
+                                    - conditions:
+                                        - condition: template
+                                          alias: "Задать лимит открытия один раз для общей number-сущности"
+                                          value_template: >-
+                                            {{ opening_entity | length > 0
+                                               and [opening_entity, opening_percentage] not in opening_commands_sent }}
+                                      sequence:
+                                        # Ошибка установки лимита прерывает запуск до открытия.
+                                        - action: number.set_value
+                                          target:
+                                            entity_id: "{{ opening_entity }}"
+                                          data:
+                                            value: "{{ opening_percentage }}"
+                                        - variables:
+                                            opening_commands_sent: "{{ opening_commands_sent + [[opening_entity, opening_percentage]] }}"
                                 - action: cover.open_cover
                                   continue_on_error: true
                                   target:

@@ -4,7 +4,7 @@ blueprint:
     Проветривает выбранные cover-окна по CO₂/TVOC, расписанию cron
     или обоим способам.
 
-    По датчикам: открытие при высоких показаниях, закрытие или приоткрытие
+    По датчикам: открытие при высоких показаниях, полное закрытие
     при нормализации. Холод закрывает окно с заданной задержкой,
     потеря показаний — сразу. Проветривание в холоде можно разрешить с паузой.
 
@@ -12,8 +12,8 @@ blueprint:
     по окончании интервала. Часовой пояс — Home Assistant.
     Перезапуск сохраняет границы расписания, но сбрасывает задержку по холоду.
 
-    Дополнительно: контактный датчик для подтверждения закрытия,
-    повторные команды, уведомления и текстовый статус.
+    Дополнительно: контроль открытия и закрытия по положению окна,
+    событиям привода и контакту, повторы команд, уведомления и текстовый статус.
   domain: automation
   homeassistant:
     min_version: 2025.9.0
@@ -89,25 +89,6 @@ blueprint:
               multiple: true
               filter:
                 - domain: cover
-        air_recovered_position:
-          name: "Положение окна при нормальном воздухе"
-          description: >-
-            Когда все выбранные CO₂/TVOC снижаются ниже порогов закрытия:
-            0% = полностью закрыто, 10% = слегка открыто, 100% = полностью
-            открыто. Положение поддерживается автоматически, в том числе
-            после ручного закрытия. Увеличение открытия разрешено только
-            при превышении температурного порога повторного открытия. При холоде или
-            потере показаний окно закрывается полностью. Если привод
-            не поддерживает управление положением или не сообщает его,
-            выполняется полное закрытие. Сначала завершается текущее движение.
-          default: 0
-          selector:
-            number:
-              min: 0
-              max: 100
-              step: 1
-              unit_of_measurement: "%"
-              mode: slider
 
     opening_section:
       name: "Уровень открытия при проветривании"
@@ -284,8 +265,7 @@ blueprint:
             ниже порога повторного открытия. После открытия проверка холода
             и задержка полного закрытия работают как обычно. При нулевой
             задержке холодное окно закроется сразу. Недоступные показания
-            по-прежнему запрещают открытие. Приоткрытие при нормальном
-            воздухе остаётся ограничено температурой. Новый цикл начинается
+            по-прежнему запрещают открытие. Новый цикл начинается
             только у закрытого окна после паузы; выбранный контактный датчик
             также должен подтверждать закрытие.
           default: false
@@ -337,8 +317,8 @@ blueprint:
             Добавьте пару и выберите окно и его контактный датчик из списков.
             Окно должно входить в выбранный выше список окон. Для каждого
             окна можно указать один отдельный датчик: off = закрыто,
-            on = открыто. Если пары не добавлены, подтверждение закрытия
-            и повторы команд отключены.
+            on = открыто. Если также выбран Opening position, оба датчика
+            должны подтвердить закрытие.
           default: []
           selector:
             object:
@@ -362,7 +342,7 @@ blueprint:
                         - domain: binary_sensor
         close_confirmation_timeout:
           name: "Ожидание подтверждения закрытия"
-          description: "Сколько ждать контактный датчик после каждой команды закрытия."
+          description: "Сколько ждать контактный датчик после каждой команды закрытия, если Opening position не выбран."
           default: 30
           selector:
             number:
@@ -377,12 +357,102 @@ blueprint:
             Число дополнительных команд за одну проверку после первоначальной.
             0 = только дождаться датчика и сообщить о неудаче.
             При недоступном контактном датчике дополнительные команды не отправляются.
+            Если выбран Opening position, используются повторы из раздела «Контроль движения».
           default: 2
           selector:
             number:
               min: 0
               max: 5
               step: 1
+              mode: box
+
+    motion_section:
+      name: "Контроль движения (опционально)"
+      icon: mdi:window-shutter-alert
+      collapsed: true
+      input:
+        window_feedback:
+          name: "Датчики положения и событий"
+          description: >-
+            Выберите Opening position и, при наличии, Last event каждого окна.
+            Если окно одно, повторно выбирать его не нужно. Открытие проверяется
+            по достигнутому лимиту (допуск ниже), без лимита — по положению больше 0%.
+            Закрытие — строго 0% и закрытый контакт, если он выбран.
+            События о температуре, TVOC, таймере и внешнем открытии не подтверждают
+            движение. После Reboot ожидается восстановление. Current overload,
+            High wind и Low battery останавливают повторы; Opening failed и
+            Closing failed разрешают повтор в пределах заданного числа попыток.
+          default: []
+          selector:
+            object:
+              multiple: true
+              label_field: position
+              description_field: last_event
+              fields:
+                window:
+                  label: "Окно (если выбрано несколько)"
+                  selector:
+                    entity:
+                      filter:
+                        - domain: cover
+                position:
+                  label: "Opening position"
+                  required: true
+                  selector:
+                    entity:
+                      filter:
+                        - domain: sensor
+                last_event:
+                  label: "Last event (опционально)"
+                  selector:
+                    entity:
+                      filter:
+                        - domain: sensor
+        motion_confirmation_timeout:
+          name: "Ожидание подтверждения движения"
+          description: "Для окон с Opening position: ожидание положения и выбранного контакта после каждой команды открытия или закрытия."
+          default: 45
+          selector:
+            number:
+              min: 5
+              max: 180
+              step: 1
+              unit_of_measurement: "сек"
+              mode: box
+        motion_retry_count:
+          name: "Повторы неподтверждённого движения"
+          description: >-
+            Дополнительные попытки открытия или закрытия за одну проверку.
+            0 = одна команда и проверка результата. Перед повтором заново
+            проверяются показания, расписание и доступность привода.
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 5
+              step: 1
+              mode: box
+        motion_retry_delay:
+          name: "Пауза перед повторной командой"
+          description: "Пауза между попытками, в том числе для восстановления после Reboot."
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 120
+              step: 1
+              unit_of_measurement: "сек"
+              mode: box
+        opening_position_tolerance:
+          name: "Допуск подтверждения открытия"
+          description: "Допустимое отклонение от заданного процента. Полное закрытие всегда требует 0%."
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 10
+              step: 1
+              unit_of_measurement: "%"
               mode: box
 
     diagnostics_section:
@@ -405,7 +475,7 @@ blueprint:
           name: "Уведомления о проблемах в Home Assistant"
           description: >-
             Сообщает о длительно плохом воздухе при заблокированном открытии
-            и о неподтверждённом закрытии. Для каждой проблемы обновляется
+            и о неподтверждённом движении. Для каждой проблемы обновляется
             одно уведомление; после устранения оно удаляется.
           default: true
           selector:
@@ -731,9 +801,35 @@ actions:
       allow_cold_ventilation: !input allow_cold_ventilation
       cold_ventilation_pause: !input cold_ventilation_pause
       cold_close_delay: !input temperature_close_delay
-      normal_position: !input air_recovered_position
       contact_pairs: !input window_contacts
       contacts: *normalize_contacts
+      feedback_pairs: !input window_feedback
+      motion_timeout: !input motion_confirmation_timeout
+      motion_retries: !input motion_retry_count
+      reboot_delay: !input motion_retry_delay
+      position_tolerance: !input opening_position_tolerance
+      feedback: >-
+        {% set ns = namespace(items=[], sensors=[], valid=feedback_pairs is sequence and feedback_pairs is not string) %}
+        {% if ns.valid %}
+          {% for pair in feedback_pairs %}
+            {% if pair is not mapping %}
+              {% set ns.valid = false %}
+            {% else %}
+              {% set window = pair.get('window') or (windows[0] if windows | count == 1 else '') %}
+              {% set position = pair.get('position', '') %}
+              {% set event = pair.get('last_event', '') %}
+              {% if window not in windows or position is not string or not position.startswith('sensor.')
+                 or event is not string or (event | length > 0 and not event.startswith('sensor.'))
+                 or position in ns.sensors or (event | length > 0 and (event in ns.sensors or event == position)) %}
+                {% set ns.valid = false %}
+              {% else %}
+                {% set ns.items = ns.items + [(window, dict(position=position, event=event))] %}
+                {% set ns.sensors = ns.sensors + [position] + ([event] if event | length > 0 else []) %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+        {{ dict(ns.items) if ns.valid and dict(ns.items) | count == feedback_pairs | count else none }}
       confirmation_timeout: !input close_confirmation_timeout
       retry_count: !input close_retry_count
       status_entity: !input status_entity
@@ -745,6 +841,9 @@ actions:
       closing_cycles: {}
       scheduled_close_windows: []
       opening_commands_sent: []
+      motion_requests: {}
+      motion_processed: {}
+      motion_verification_in_progress: false
       notification_prefix: "air_ventilation_{{ this.entity_id | replace('.', '_') }}"
 
   - variables:
@@ -802,7 +901,12 @@ actions:
 
   - variables:
       configuration_valid: >-
-        {% set ns = namespace(valid=contacts is mapping
+        {% set ns = namespace(valid=contacts is mapping and feedback is mapping
+           and is_number(motion_timeout) and 5 <= motion_timeout | float <= 180
+           and is_number(motion_retries) and 0 <= motion_retries | float <= 5
+           and motion_retries | float == motion_retries | int
+           and is_number(reboot_delay) and 5 <= reboot_delay | float <= 120
+           and is_number(position_tolerance) and 0 <= position_tolerance | float <= 10
            and control_mode in ['sensors', 'periodic', 'combined']) %}
         {% set outputs = ([(sensor_opening_entity, sensor_opening_percentage)] if control_mode != 'periodic' else [])
            + ([(periodic_opening_entity, periodic_opening_percentage)] if control_mode != 'sensors' else []) %}
@@ -830,8 +934,6 @@ actions:
               co2_entities | count + tvoc_entities | count > 0
               and (co2_entities | count == 0 or co2_open | float > co2_close | float)
               and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
-              and is_number(normal_position) and 0 <= normal_position | float <= 100
-              and normal_position | float == normal_position | int
               and is_number(cold_ventilation_pause) and 1 <= cold_ventilation_pause | float <= 1440
               and reopening_temperature | float > minimum_temperature | float))
          and (control_mode == 'sensors' or (
@@ -988,8 +1090,7 @@ actions:
         {% elif not readings.valid %}
           close
         {% elif readings.recovered %}
-          {{ 'position' if normal_position | int > 0
-             and readings.temperature > minimum_temperature | float else 'close' }}
+          close
         {% elif readings.temperature <= minimum_temperature | float %}
           {{ 'close_cold' if cold_close_delay | float > 0 else 'close' }}
         {% elif readings.high and readings.temperature >= reopening_temperature | float %}
@@ -1019,21 +1120,7 @@ actions:
         {% elif not readings.valid %}
           Закрытие: нет корректных показаний датчиков
         {% elif readings.recovered %}
-          {% if window_action == 'position' %}
-            {% set ns = namespace(fallback=false) %}
-            {% for window in windows %}
-              {% set position = state_attr(window, 'current_position') %}
-              {% if state_attr(window, 'supported_features') | int(0) | bitwise_and(4) == 0
-                 or not is_number(position) or not 0 <= position | float <= 100 %}
-                {% set ns.fallback = true %}
-              {% endif %}
-            {% endfor %}
-            Воздух в норме: целевое открытие {{ normal_position | int }}%;
-            увеличение открытия разрешено от {{ reopening_temperature }} °C
-            {{ '; окна без управления положением закрываются полностью' if ns.fallback else '' }}
-          {% else %}
-            Закрытие: качество воздуха восстановлено
-          {% endif %}
+          Закрытие: качество воздуха восстановлено
         {% elif readings.temperature <= minimum_temperature | float %}
           {% if windows | select('is_state', 'open') | list | count == 0
              and windows | select('is_state', 'opening') | list | count == 0
@@ -1103,12 +1190,37 @@ actions:
                 - *refresh_temperature_entities
                 - *refresh_readings
                 - *refresh_schedule
+                - &refresh_motion_feedback
+                  variables:
+                    motion_position_sensor: "{{ feedback.get(current_window, {}).get('position', '') }}"
+                    motion_event_sensor: "{{ feedback.get(current_window, {}).get('event', '') }}"
+                    motion_position: "{{ states(motion_position_sensor) if motion_position_sensor | length > 0 else none }}"
+                    motion_event: "{{ states(motion_event_sensor) if motion_event_sensor | length > 0 else '' }}"
+                    parallel_feedback_run: >-
+                      {{ current_window in feedback and not motion_verification_in_progress
+                         and trigger is defined
+                         and trigger.id | default('') in ['window_changed', 'periodic_check', 'schedule_check']
+                         and state_attr(this.entity_id, 'current') | int(0) > 1 }}
+                    motor_open_allowed: >-
+                      {{ motion_event not in ['Current overload', 'High wind', 'Low battery']
+                         and (motion_event != 'Reboot'
+                              or as_timestamp(now()) - as_timestamp(states[motion_event_sensor].last_changed, 0)
+                                 >= reboot_delay | float)
+                         and (not parallel_feedback_run
+                              or (schedule_state.active and schedule_state.started_at
+                                  > as_timestamp(states[current_window].last_changed, 0))) }}
+                    opening_position_mismatch: >-
+                      {{ motion_position_sensor | length > 0 and is_number(motion_position)
+                         and 0 <= motion_position | float <= 100
+                         and (motion_position | float == 0
+                              or (opening_entity | length > 0
+                                  and (motion_position | float - opening_percentage | float) | abs > position_tolerance | float)) }}
                 - choose:
                     - conditions:
                         - condition: template
                           alias: "Окно закрыто, пауза прошла и показания разрешают проветривание"
                           value_template: >-
-                            {{ not schedule_state.active and opening_command_available
+                            {{ not schedule_state.active and opening_command_available and motor_open_allowed
                                and readings.valid and readings.high and not readings.recovered
                                and readings.temperature < reopening_temperature | float
                                and is_state(current_window, 'closed')
@@ -1124,8 +1236,35 @@ actions:
                             - conditions:
                                 - condition: template
                                   alias: "Ограничение открытия доступно или не задано"
-                                  value_template: "{{ opening_command_available }}"
+                                  value_template: "{{ opening_command_available and motor_open_allowed }}"
                               sequence:
+                                - variables:
+                                    motion_kind: open
+                                - &remember_motion_request
+                                  variables:
+                                    motion_requests: >-
+                                      {% if current_window in feedback %}
+                                        {% set pair = feedback[current_window] %}
+                                        {% set event_at = as_timestamp(states[pair.event].last_changed, 0)
+                                           if pair.event | length > 0 else 0 %}
+                                        {% set position_at = as_timestamp(states[pair.position].last_reported, 0)
+                                           if states[pair.position] is defined else 0 %}
+                                        {{ dict(motion_requests.items() | list + [(current_window,
+                                           dict(window=current_window, motion=motion_kind,
+                                                target=opening_percentage if motion_kind == 'open' and opening_entity | length > 0 else 0,
+                                                limit=opening_entity if motion_kind == 'open' else '',
+                                                position=pair.position, event=pair.event,
+                                                event_at=event_at, position_at=position_at,
+                                                sent_at=as_timestamp(now()),
+                                                periodic=schedule_state.active,
+                                                ends_at=schedule_state.ends_at if schedule_state.active else 0))]) }}
+                                      {% else %}
+                                        {{ motion_requests }}
+                                      {% endif %}
+                                - variables:
+                                    limit_command_ok: >-
+                                      {{ opening_entity | length == 0
+                                         or [opening_entity, opening_percentage] in opening_commands_sent }}
                                 - choose:
                                     - conditions:
                                         - condition: template
@@ -1134,7 +1273,8 @@ actions:
                                             {{ opening_entity | length > 0
                                                and [opening_entity, opening_percentage] not in opening_commands_sent }}
                                       sequence:
-                                        # Ошибка установки лимита прерывает запуск до открытия.
+                                        # При ошибке лимита пропускаем OPEN. Для выбранного
+                                        # Opening position повтором занимается проверка ниже.
                                         - action: number.set_value
                                           target:
                                             entity_id: "{{ opening_entity }}"
@@ -1142,10 +1282,22 @@ actions:
                                             value: "{{ opening_percentage }}"
                                         - variables:
                                             opening_commands_sent: "{{ opening_commands_sent + [[opening_entity, opening_percentage]] }}"
-                                - action: cover.open_cover
+                                            limit_command_ok: true
                                   continue_on_error: true
-                                  target:
-                                    entity_id: "{{ current_window }}"
+                                - choose:
+                                    - conditions:
+                                        - condition: template
+                                          alias: "Лимит установлен — можно отправить OPEN"
+                                          value_template: "{{ limit_command_ok }}"
+                                      sequence:
+                                        - action: cover.open_cover
+                                          continue_on_error: true
+                                          target:
+                                            entity_id: "{{ current_window }}"
+                                  default:
+                                    - variables:
+                                        ventilation_status: "Открытие не выполнено: не удалось установить лимит {{ opening_entity }}"
+                                    - *publish_status
           - *refresh_temperature_entities
           - *refresh_readings
           - *refresh_schedule
@@ -1239,16 +1391,18 @@ actions:
         - *refresh_temperature_entities
         - *refresh_readings
         - *refresh_schedule
+        - *refresh_motion_feedback
         - &refresh_window_requirements
           variables:
             periodic_active: "{{ schedule_state.active }}"
             periodic_close_due: >-
               {{ control_mode != 'sensors' and not periodic_active
                  and (control_mode == 'periodic'
-                      or (verification_in_progress | default(false) and current_window in scheduled_close_windows)
+                      or ((verification_in_progress | default(false) or motion_verification_in_progress)
+                          and current_window in scheduled_close_windows)
                       or (schedule_state.closing_due and trigger is defined
                           and trigger.id | default('') in ['periodic_check', 'schedule_check']))
-                 and not (verification_in_progress | default(false)
+                 and not (verification_in_progress | default(false) and not motion_verification_in_progress
                           and current_window in closing_cycles
                           and states(current_window) in ['open', 'opening']
                           and as_timestamp(states[current_window].last_changed, 0) != closing_cycles[current_window]) }}
@@ -1260,8 +1414,7 @@ actions:
               {{ not periodic_active and (periodic_close_due
                  or (control_mode != 'periodic' and (
                       not readings.valid
-                      or (readings.recovered and (normal_position | int == 0 or not position_available
-                          or readings.temperature <= minimum_temperature | float))
+                      or readings.recovered
                       or (readings.temperature <= minimum_temperature | float
                           and (cold_close_delay | float == 0
                                or (current_window in cold_wait_expired
@@ -1275,7 +1428,16 @@ actions:
                   alias: "Окно нужно закрыть по актуальным показаниям"
                   value_template: >-
                     {{ full_close_required
+                       and (not parallel_feedback_run
+                            or (periodic_close_due and schedule_state.closing_due
+                                and states(current_window) in ['open', 'opening']))
                        and (states(current_window) in ['open', 'opening']
+                            or (current_window in feedback
+                                and (not is_number(motion_position) or motion_position | float != 0)
+                                and states(current_window) not in ['unknown', 'unavailable']
+                                and not (trigger is defined and trigger.id | default('') == 'window_changed'
+                                    and trigger.entity_id | default('') == current_window
+                                    and state_attr(this.entity_id, 'current') | int(0) > 1))
                             or (contact_sensor | length > 0 and not is_state(contact_sensor, 'off')
                                 and states(current_window) not in ['unknown', 'unavailable']
                                 and not (trigger is defined
@@ -1284,12 +1446,14 @@ actions:
                                     and states(current_window) in ['closed', 'closing']))) }}
               sequence:
                 - variables:
+                    motion_kind: close
                     closing_cycles: >-
                       {{ dict(closing_cycles.items() | list
                            + [(current_window, as_timestamp(states[current_window].last_changed, 0))]) }}
                     scheduled_close_windows: >-
                       {{ scheduled_close_windows + [current_window]
                          if periodic_close_due else scheduled_close_windows }}
+                - *remember_motion_request
                 - action: cover.close_cover
                   continue_on_error: true
                   target:
@@ -1307,10 +1471,11 @@ actions:
                 - condition: template
                   alias: "Открыть окно в текущем интервале расписания"
                   value_template: >-
-                    {{ periodic_active and opening_command_available
+                    {{ periodic_active and opening_command_available and motor_open_allowed
                        and (states(current_window) in ['closed', 'closing']
                             or (is_state(current_window, 'open')
-                                and ((opening_entity | length > 0 and not opening_level_matches)
+                                and (opening_position_mismatch
+                                     or (opening_entity | length > 0 and not opening_level_matches)
                                      or (opening_entity | length == 0 and position_available
                                          and current_position | float < 100))))
                        and (states(current_window) not in ['closed', 'closing']
@@ -1323,39 +1488,20 @@ actions:
                 - *open_ventilation_window
             - conditions:
                 - condition: template
-                  alias: "Воздух в норме и можно установить заданное положение окна"
-                  value_template: >-
-                    {{ control_mode != 'periodic' and not periodic_active and not periodic_close_due
-                       and window_action == 'position' and readings.valid and readings.recovered
-                       and readings.temperature > minimum_temperature | float
-                       and position_available and states(current_window) in ['open', 'closed']
-                       and current_position | float != normal_position | int
-                       and (current_position | float > normal_position | int
-                            or readings.temperature >= reopening_temperature | float) }}
-              sequence:
-                - action: cover.set_cover_position
-                  continue_on_error: true
-                  target:
-                    entity_id: "{{ current_window }}"
-                  data:
-                    position: "{{ normal_position | int }}"
-            - conditions:
-                - condition: template
                   alias: "Воздух требует проветривания и температура разрешает открытие"
                   value_template: >-
                     {{ control_mode != 'periodic' and not periodic_active and not periodic_close_due
-                       and opening_command_available and window_action == 'open'
+                       and opening_command_available and motor_open_allowed and window_action == 'open'
                        and readings.valid and readings.high and not readings.recovered
                        and readings.temperature >= reopening_temperature | float
                        and (states(current_window) in ['closed', 'closing']
                             or (is_state(current_window, 'open')
-                                and ((opening_entity | length > 0 and not opening_level_matches)
-                                     or (opening_entity | length == 0 and normal_position | int > 0
-                                         and is_number(current_position) and current_position | float < 100)))) }}
+                                and (opening_position_mismatch
+                                     or (opening_entity | length > 0 and not opening_level_matches)))) }}
               sequence:
                 - *open_ventilation_window
 
-        - alias: "Удалить уведомление после закрытия или перехода к приоткрытию"
+        - alias: "Удалить неактуальное уведомление о закрытии"
           choose:
             - conditions:
                 - condition: template
@@ -1369,10 +1515,63 @@ actions:
                   data:
                     notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"
 
+        - alias: "Сообщить о запрете открытия самим приводом"
+          choose:
+            - conditions:
+                - condition: template
+                  alias: "Привод сообщил о проблеме, пока требуется открытие"
+                  value_template: >-
+                    {{ current_window in feedback and not motor_open_allowed
+                       and motion_event in ['Current overload', 'High wind', 'Low battery', 'Reboot']
+                       and not full_close_required
+                       and (periodic_active or (control_mode != 'periodic' and readings.valid
+                            and readings.high and not readings.recovered
+                            and (readings.temperature >= reopening_temperature | float or allow_cold_ventilation))) }}
+              sequence:
+                - variables:
+                    ventilation_status: "Открытие заблокировано приводом: {{ current_window }}, {{ motion_event }}"
+                - *publish_status
+                - choose:
+                    - conditions:
+                        - condition: template
+                          alias: "Уведомления включены"
+                          value_template: "{{ notifications_enabled }}"
+                      sequence:
+                        - action: persistent_notification.create
+                          continue_on_error: true
+                          data:
+                            notification_id: "{{ notification_prefix }}_motion_{{ current_window | replace('.', '_') }}"
+                            title: "Проветривание: привод запрещает открытие"
+                            message: "{{ ventilation_status }}"
+
+        - alias: "Удалить ошибку после запоздавшего подтверждения движения"
+          choose:
+            - conditions:
+                - condition: template
+                  alias: "Свежие показания подтвердили положение вне текущей проверки"
+                  value_template: >-
+                    {{ current_window in feedback and current_window not in motion_requests
+                       and is_number(motion_position) and 0 <= motion_position | float <= 100
+                       and state_attr(motion_position_sensor, 'unit_of_measurement') == '%'
+                       and as_timestamp(states[motion_position_sensor].last_reported, 0)
+                           > as_timestamp(states[current_window].last_changed, 0)
+                       and motion_event not in ['Reboot', 'Current overload', 'High wind', 'Low battery', 'Opening failed', 'Closing failed']
+                       and ((full_close_required and motion_position | float == 0
+                             and (contact_sensor | length == 0 or is_state(contact_sensor, 'off')))
+                            or (not full_close_required and motor_open_allowed and not opening_position_mismatch
+                                and motion_position | float > 0
+                                and (contact_sensor | length == 0 or is_state(contact_sensor, 'on')))) }}
+              sequence:
+                - action: persistent_notification.dismiss
+                  continue_on_error: true
+                  data:
+                    notification_id: "{{ notification_prefix }}_motion_{{ current_window | replace('.', '_') }}"
+
   # Запоминаем состояние каждого окна перед ожиданием закрытия по холоду:
   # ожидание предыдущего открытия не должно закрыть следующий цикл.
   # Обычные обновления датчиков не запускают дополнительные ожидания.
   - variables:
+      cold_wait_started_at: "{{ as_timestamp(now()) }}"
       cold_wait_windows: >-
         {% set ns = namespace(items=[]) %}
         {% set event_id = trigger.id | default('') if trigger is defined else '' %}
@@ -1387,6 +1586,8 @@ actions:
            and readings.temperature <= minimum_temperature | float %}
           {% for window in windows | unique %}
             {% if (states(window) in ['open', 'opening']
+                    or (window in feedback and is_number(states(feedback[window].position))
+                        and states(feedback[window].position) | float > 0)
                     or (is_state(window, 'closed') and window in contacts
                         and not is_state(contacts[window], 'off')))
                and (event_id != 'window_changed' or trigger.entity_id | default('') == window
@@ -1396,6 +1597,284 @@ actions:
           {% endfor %}
         {% endif %}
         {{ dict(ns.items) }}
+  # Проверяем фактический датчик, а не оптимистичное состояние cover.
+  # Последняя команда этому окну заменяет предыдущую (например, закрытие
+  # по холоду заменяет открытие). Первые команды уже отправлены всем окнам.
+  - &verify_motion_requests
+    repeat:
+      for_each: >-
+        {% set ns = namespace(requests=[]) %}
+        {% for request in motion_requests.values() %}
+          {% if motion_processed.get(request.window) != [request.motion, request.sent_at] %}
+            {% set ns.requests = ns.requests + [request] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.requests }}
+      sequence:
+        - variables:
+            motion_request: "{{ repeat.item }}"
+            current_window: "{{ motion_request.window }}"
+            contact_sensor: "{{ contacts.get(current_window, '') }}"
+            motion_done: false
+            motion_success: false
+            motion_cancelled: false
+            motion_reason: ""
+            motion_reboot_at: 0
+            motion_attempts: "{{ dict(open=0, close=0) }}"
+            motion_verification_in_progress: true
+        # Дополнительный проход нужен, если открытие сменилось закрытием.
+        # Для каждого направления всё равно не более motion_retries повторов.
+        - repeat:
+            count: "{{ 2 * (motion_retries | int + 1) }}"
+            sequence:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        alias: "Проверка этой команды ещё не завершена"
+                        value_template: "{{ not motion_done }}"
+                    sequence:
+                      - variables:
+                          motion_success: &motion_is_confirmed >-
+                            {% set value = states(motion_request.position) %}
+                            {% set reported = as_timestamp(states[motion_request.position].last_reported, 0) %}
+                            {% set fresh_fault = motion_request.event | length > 0
+                               and as_timestamp(states[motion_request.event].last_changed, 0) > motion_request.event_at
+                               and states(motion_request.event) in ['Reboot', 'Opening failed', 'Closing failed',
+                                                                  'Current overload', 'High wind', 'Low battery'] %}
+                            {{ is_number(value) and 0 <= value | float <= 100
+                               and state_attr(motion_request.position, 'unit_of_measurement') == '%'
+                               and reported > [motion_request.position_at, motion_reboot_at] | max
+                               and not fresh_fault
+                               and (contact_sensor | length == 0
+                                    or is_state(contact_sensor, 'off' if motion_request.motion == 'close' else 'on'))
+                               and (value | float == 0 if motion_request.motion == 'close'
+                                    else (value | float > 0
+                                          and (motion_request.limit | length == 0
+                                               or (is_number(states(motion_request.limit))
+                                                   and states(motion_request.limit) | float == motion_request.target | float
+                                                   and (value | float - motion_request.target | float) | abs <= position_tolerance | float)))) }}
+                          motion_fault: &motion_has_fresh_fault >-
+                            {{ motion_request.event | length > 0
+                               and as_timestamp(states[motion_request.event].last_changed, 0) > motion_request.event_at
+                               and states(motion_request.event) in ['Reboot', 'Opening failed', 'Closing failed',
+                                                                  'Current overload', 'High wind', 'Low battery'] }}
+                          motion_wait_seconds: >-
+                            {% set limits = [motion_timeout | float] %}
+                            {% if motion_request.motion == 'open' %}
+                              {% if motion_request.periodic %}
+                                {% set limits = limits + [[0, motion_request.ends_at - as_timestamp(now())] | max] %}
+                              {% endif %}
+                              {% if current_window in cold_wait_windows %}
+                                {% set limits = limits + [[0, cold_wait_started_at + cold_close_delay | float * 60
+                                                          - as_timestamp(now())] | max] %}
+                              {% endif %}
+                            {% endif %}
+                            {{ limits | min }}
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                alias: "Дождаться положения либо нового события ошибки"
+                                value_template: "{{ not motion_success and not motion_fault and motion_wait_seconds | float > 0 }}"
+                            sequence:
+                              - wait_for_trigger:
+                                  - trigger: template
+                                    value_template: *motion_is_confirmed
+                                  - trigger: template
+                                    value_template: *motion_has_fresh_fault
+                                timeout:
+                                  seconds: "{{ motion_wait_seconds }}"
+                                continue_on_timeout: true
+                      - variables:
+                          motion_reboot_at: >-
+                            {{ [motion_reboot_at, as_timestamp(states[motion_request.event].last_changed, 0)] | max
+                               if motion_request.event | length > 0 and is_state(motion_request.event, 'Reboot')
+                                  and as_timestamp(states[motion_request.event].last_changed, 0) > motion_request.event_at
+                               else motion_reboot_at }}
+                          motion_success: *motion_is_confirmed
+                      - *refresh_temperature_entities
+                      - *refresh_readings
+                      - *refresh_schedule
+                      - *refresh_motion_feedback
+                      - &expire_motion_cold_wait
+                        variables:
+                          cold_wait_expired: >-
+                            {{ dict(cold_wait_expired.items() | list + [(current_window, cold_wait_windows[current_window])])
+                               if motion_request.motion == 'open' and current_window in cold_wait_windows
+                                  and as_timestamp(now()) >= cold_wait_started_at + cold_close_delay | float * 60
+                               else cold_wait_expired }}
+                      - *refresh_window_requirements
+                      - variables:
+                          motion_policy_valid: &motion_policy_valid >-
+                            {% if motion_request.motion == 'close' %}
+                              {{ full_close_required }}
+                            {% else %}
+                              {{ not full_close_required and opening_command_available
+                                 and not (current_window in cold_wait_windows
+                                          and as_timestamp(now()) >= cold_wait_started_at + cold_close_delay | float * 60)
+                                 and opening_entity == motion_request.limit
+                                 and (motion_request.limit | length == 0 or opening_percentage == motion_request.target)
+                                 and ((motion_request.periodic and periodic_active
+                                       and as_timestamp(now()) < motion_request.ends_at)
+                                      or (not motion_request.periodic and not periodic_active
+                                          and readings.valid and readings.high and not readings.recovered
+                                          and (readings.temperature >= reopening_temperature | float
+                                               or (allow_cold_ventilation and cold_close_delay | float > 0
+                                                   and as_timestamp(now()) - motion_request.sent_at < cold_close_delay | float * 60)))) }}
+                            {% endif %}
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                alias: "Вместо открытия теперь требуется закрытие"
+                                value_template: "{{ motion_request.motion == 'open' and not motion_policy_valid and full_close_required }}"
+                            sequence:
+                              - variables:
+                                  motion_kind: close
+                                  scheduled_close_windows: >-
+                                    {{ scheduled_close_windows + [current_window]
+                                       if periodic_close_due else scheduled_close_windows }}
+                              - *remember_motion_request
+                              - action: cover.close_cover
+                                continue_on_error: true
+                                target:
+                                  entity_id: "{{ current_window }}"
+                              - variables:
+                                  motion_request: "{{ motion_requests[current_window] }}"
+                                  motion_success: false
+                          - conditions:
+                              - condition: template
+                                alias: "Причина команды исчезла — не повторять её"
+                                value_template: "{{ not motion_policy_valid }}"
+                            sequence:
+                              - variables:
+                                  motion_done: true
+                                  motion_cancelled: true
+                          - conditions:
+                              - condition: template
+                                alias: "Фактическое положение подтвердило результат"
+                                value_template: "{{ motion_success }}"
+                            sequence:
+                              - variables:
+                                  motion_done: true
+                          - conditions:
+                              - condition: template
+                                alias: "Можно использовать следующую попытку"
+                                value_template: >-
+                                  {{ motion_attempts[motion_request.motion] < motion_retries | int
+                                     and motion_event not in ['Current overload', 'High wind', 'Low battery'] }}
+                            sequence:
+                              - delay:
+                                  seconds: >-
+                                    {{ [reboot_delay | float,
+                                        [0, cold_wait_started_at + cold_close_delay | float * 60 - as_timestamp(now())] | max] | min
+                                       if motion_request.motion == 'open' and current_window in cold_wait_windows
+                                       else reboot_delay | float }}
+                              - *refresh_temperature_entities
+                              - *refresh_readings
+                              - *refresh_schedule
+                              - *refresh_motion_feedback
+                              - *expire_motion_cold_wait
+                              - *refresh_window_requirements
+                              - variables:
+                                  motion_policy_valid: *motion_policy_valid
+                                  motion_success: *motion_is_confirmed
+                              - choose:
+                                  - conditions:
+                                      - condition: template
+                                        alias: "Результат получен во время паузы"
+                                        value_template: "{{ motion_policy_valid and motion_success }}"
+                                    sequence:
+                                      - variables:
+                                          motion_done: true
+                                  - conditions:
+                                      - condition: template
+                                        alias: "Пауза завершилась, привод доступен, команда всё ещё нужна"
+                                        value_template: >-
+                                          {{ motion_policy_valid and not motion_success
+                                             and states(current_window) not in ['unknown', 'unavailable']
+                                             and is_number(motion_position) and 0 <= motion_position | float <= 100
+                                             and state_attr(motion_position_sensor, 'unit_of_measurement') == '%'
+                                             and (motion_event_sensor | length == 0
+                                                  or motion_event not in ['unknown', 'unavailable', 'Current overload', 'High wind', 'Low battery'])
+                                             and (motion_event != 'Reboot'
+                                                  or as_timestamp(now()) - as_timestamp(states[motion_event_sensor].last_changed, 0)
+                                                     >= reboot_delay | float) }}
+                                    sequence:
+                                      - variables:
+                                          motion_attempts: >-
+                                            {{ dict(motion_attempts.items() | list + [(motion_request.motion,
+                                                 motion_attempts[motion_request.motion] + 1)]) }}
+                                          motion_kind: "{{ motion_request.motion }}"
+                                      - choose:
+                                          - conditions:
+                                              - condition: template
+                                                alias: "Повторить открытие с тем же лимитом"
+                                                value_template: "{{ motion_kind == 'open' }}"
+                                            sequence:
+                                              - variables:
+                                                  opening_commands_sent: []
+                                              - *open_ventilation_window
+                                        default:
+                                          - *remember_motion_request
+                                          - action: cover.close_cover
+                                            continue_on_error: true
+                                            target:
+                                              entity_id: "{{ current_window }}"
+                                      - variables:
+                                          motion_request: "{{ motion_requests[current_window] }}"
+                                default:
+                                  - variables:
+                                      motion_done: "{{ motion_policy_valid }}"
+                                      motion_reason: "Привод или датчики недоступны, либо событие запрещает повтор"
+                        default:
+                          - variables:
+                              motion_done: true
+                              motion_reason: "Лимит повторов исчерпан либо привод сообщил о перегрузке, ветре или низком заряде"
+        - choose:
+            - conditions:
+                - condition: template
+                  alias: "Движение подтверждено фактическим положением"
+                  value_template: "{{ motion_success }}"
+              sequence:
+                - action: persistent_notification.dismiss
+                  continue_on_error: true
+                  data:
+                    notification_id: "{{ notification_prefix }}_motion_{{ current_window | replace('.', '_') }}"
+                - variables:
+                    ventilation_status: >-
+                      {{ ('Закрытие подтверждено: ' if motion_request.motion == 'close' else 'Открытие подтверждено: ')
+                         + current_window + ', ' + states(motion_request.position) + '%' }}
+                - *publish_status
+            - conditions:
+                - condition: template
+                  alias: "Условия изменились — оставить результат более нового запуска"
+                  value_template: "{{ motion_cancelled }}"
+              sequence: []
+          default:
+            - variables:
+                ventilation_status: >-
+                  {{ 'Закрытие' if motion_request.motion == 'close' else 'Открытие' }} не подтверждено:
+                  {{ current_window }}, положение {{ states(motion_request.position) }}%,
+                  событие {{ states(motion_request.event) if motion_request.event | length > 0 else 'не выбрано' }}.
+                  {{ motion_reason }}
+            - *publish_status
+            - choose:
+                - conditions:
+                    - condition: template
+                      alias: "Уведомления включены"
+                      value_template: "{{ notifications_enabled }}"
+                  sequence:
+                    - action: persistent_notification.create
+                      continue_on_error: true
+                      data:
+                        notification_id: "{{ notification_prefix }}_motion_{{ current_window | replace('.', '_') }}"
+                        title: "Проветривание: движение окна не подтверждено"
+                        message: "{{ ventilation_status }} Повторов: {{ motion_attempts[motion_request.motion] }}."
+        - variables:
+            motion_processed: >-
+              {{ dict(motion_processed.items() | list + [(current_window,
+                   [motion_request.motion, motion_request.sent_at])]) }}
+            motion_verification_in_progress: false
+
   - alias: "Выдержать задержку закрытия по холоду"
     choose:
       - conditions:
@@ -1436,6 +1915,8 @@ actions:
                   {% set ns = namespace(pending=false) %}
                   {% for window, opened_at in cold_wait_windows.items() %}
                     {% if (states(window) in ['open', 'opening']
+                           or (window in feedback and is_number(states(feedback[window].position))
+                               and states(feedback[window].position) | float > 0)
                            or (is_state(window, 'closed') and window in contacts
                                and not is_state(contacts[window], 'off')))
                        and as_timestamp(states[window].last_changed, 0) == opened_at %}
@@ -1444,7 +1925,7 @@ actions:
                   {% endfor %}
                   {{ not ns.pending }}
             timeout:
-              minutes: "{{ cold_close_delay | float }}"
+              seconds: "{{ [0, cold_close_delay | float * 60 - (as_timestamp(now()) - cold_wait_started_at)] | max }}"
             continue_on_timeout: true
           - variables:
               cold_wait_expired: "{{ cold_wait_windows if not wait.completed else {} }}"
@@ -1462,13 +1943,14 @@ actions:
                 - *refresh_temperature_entities
                 - *refresh_readings
                 - *refresh_schedule
+                - *refresh_motion_feedback
                 - *refresh_window_requirements
                 - *dispatch_window_command
 
   # Сначала команды отправлены всем окнам, затем проверяем контакты.
   # Ожидание одного датчика не задерживает первоначальное закрытие остальных.
   - repeat:
-      for_each: "{{ closing_requests }}"
+      for_each: "{{ closing_requests | reject('in', feedback.keys() | list) | list }}"
       sequence:
         - variables:
             verification_in_progress: true
@@ -1484,6 +1966,7 @@ actions:
               - *refresh_temperature_entities
               - *refresh_readings
               - *refresh_schedule
+              - *refresh_motion_feedback
               - *refresh_window_requirements
               - alias: "Повторить закрытие при открытом контакте"
                 choose:
@@ -1506,6 +1989,7 @@ actions:
         - *refresh_temperature_entities
         - *refresh_readings
         - *refresh_schedule
+        - *refresh_motion_feedback
         - *refresh_window_requirements
         - alias: "Обработать результат проверки закрытия"
           choose:
@@ -1540,3 +2024,6 @@ actions:
               continue_on_error: true
               data:
                 notification_id: "{{ notification_prefix }}_close_{{ current_window | replace('.', '_') }}"
+
+  # Закрытие по холоду могло заменить уже проверенную команду открытия.
+  - *verify_motion_requests

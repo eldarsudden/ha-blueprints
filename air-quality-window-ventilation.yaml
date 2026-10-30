@@ -8,9 +8,14 @@ blueprint:
     при нормализации. Холод закрывает окно с заданной задержкой,
     потеря показаний — сразу. Проветривание в холоде можно разрешить с паузой.
 
+    Ручное открытие сохраняется; автоматически закрывается только по холоду
+    с заданной задержкой. Новый цикл по cron или превышению CO₂/TVOC
+    подхватывает уже открытое окно. После перезапуска уже открытые окна считаются ручными.
+
     Cron: открывает независимо от всех датчиков и полностью закрывает
     по окончании интервала. Часовой пояс — Home Assistant.
-    Перезапуск сохраняет границы расписания, но сбрасывает задержку по холоду.
+    Перезапуск сохраняет границы расписания, но сбрасывает задержку по холоду
+    и сведения о том, какие окна открыл текущий цикл.
 
     Дополнительно: контроль открытия и закрытия по положению окна,
     событиям привода и контакту, повторы команд, уведомления и текстовый статус.
@@ -655,7 +660,6 @@ triggers:
   # linkquality и current_position при движении окна.
   - trigger: state
     entity_id: !input temperature_sensors
-    enabled: "{{ control_mode != 'periodic' }}"
     to: null
     id: temperature_changed
   - trigger: state
@@ -666,7 +670,7 @@ triggers:
   # trigger. Шаблоны следят за холодом/потерей показаний и прогревом комнаты.
   - trigger: template
     id: room_cold_or_unavailable
-    value_template: >-
+    value_template: &room_cold_condition >-
       {% set ns = namespace(values=[], valid=true) %}
       {% set sensors = selected_temperature_sensors %}
       {% if sensors | count == 0 %}
@@ -686,8 +690,8 @@ triggers:
           {% set ns.values = ns.values + [celsius | round(3)] %}
         {% endif %}
       {% endfor %}
-      {{ control_mode != 'periodic' and (not ns.valid or ns.values | count == 0
-         or ns.values | min <= minimum_temperature | float) }}
+      {{ not ns.valid or ns.values | count == 0
+         or ns.values | min <= minimum_temperature | float }}
   - trigger: template
     id: room_warmed_up
     value_template: >-
@@ -844,6 +848,12 @@ actions:
       motion_requests: {}
       motion_processed: {}
       motion_verification_in_progress: false
+      automatic_windows: {}
+      automatic_monitoring: false
+      auto_closing_windows: []
+      run_started_at: "{{ as_timestamp(now()) }}"
+      allow_cycle_takeover: true
+      sensor_cycle_edge: false
       notification_prefix: "air_ventilation_{{ this.entity_id | replace('.', '_') }}"
 
   - variables:
@@ -1192,12 +1202,35 @@ actions:
                 - *refresh_schedule
                 - &refresh_motion_feedback
                   variables:
+                    # Ручная команда отменяет владение текущего цикла.
+                    # Last event используется только как событие, а не вечный флаг.
+                    automatic_windows: >-
+                      {% set ns = namespace(items=[]) %}
+                      {% for window, owned in automatic_windows.items() %}
+                        {% set state = states[window] %}
+                        {% set event = feedback.get(window, {}).get('event', '') %}
+                        {% set manual_context = state.context is defined
+                           and state.context.user_id is not none
+                           and state.context.id != owned.context
+                           and as_timestamp(state.last_changed, 0) > owned.opened_at
+                           and states(window) in ['open', 'opening', 'closed', 'closing'] %}
+                        {% set external = event | length > 0 and is_state(event, 'External opening')
+                           and as_timestamp(states[event].last_changed, 0) > owned.opened_at %}
+                        {% set manually_closed = automatic_monitoring and not motion_verification_in_progress
+                           and window not in auto_closing_windows and states(window) in ['closed', 'closing'] %}
+                        {% if not manual_context and not external and not manually_closed %}
+                          {% set updated = dict(owned, ends_at=[owned.ends_at, schedule_state.ends_at] | max)
+                             if owned.periodic and schedule_state.active else owned %}
+                          {% set ns.items = ns.items + [(window, updated)] %}
+                        {% endif %}
+                      {% endfor %}
+                      {{ dict(ns.items) }}
                     motion_position_sensor: "{{ feedback.get(current_window, {}).get('position', '') }}"
                     motion_event_sensor: "{{ feedback.get(current_window, {}).get('event', '') }}"
                     motion_position: "{{ states(motion_position_sensor) if motion_position_sensor | length > 0 else none }}"
                     motion_event: "{{ states(motion_event_sensor) if motion_event_sensor | length > 0 else '' }}"
                     parallel_feedback_run: >-
-                      {{ current_window in feedback and not motion_verification_in_progress
+                      {{ current_window in feedback and not motion_verification_in_progress and not automatic_monitoring
                          and trigger is defined
                          and trigger.id | default('') in ['window_changed', 'periodic_check', 'schedule_check']
                          and state_attr(this.entity_id, 'current') | int(0) > 1 }}
@@ -1215,6 +1248,21 @@ actions:
                          and (motion_position | float == 0
                               or (opening_entity | length > 0
                                   and (motion_position | float - opening_percentage | float) | abs > position_tolerance | float)) }}
+                    take_open_window: >-
+                      {% set open_window = states(current_window) in ['open', 'opening']
+                         or (is_number(motion_position) and motion_position | float > 0) %}
+                      {% set available_owner = automatic_monitoring
+                         or state_attr(this.entity_id, 'current') | int(0) <= 1 %}
+                      {{ allow_cycle_takeover and available_owner and open_window
+                         and current_window not in automatic_windows
+                         and ((schedule_state.active
+                               and (automatic_monitoring or (trigger is defined and trigger.id | default('') == 'periodic_check'))
+                               and 0 <= as_timestamp(now()) - schedule_state.started_at < 60
+                               and as_timestamp(states[current_window].last_changed, 0) <= schedule_state.started_at)
+                              or (control_mode != 'periodic' and not schedule_state.active
+                                  and (sensor_cycle_edge or (not automatic_monitoring and trigger is defined
+                                       and trigger.id | default('') == 'air_high'
+                                       and as_timestamp(states[current_window].last_changed, 0) <= run_started_at)))) }}
                 - choose:
                     - conditions:
                         - condition: template
@@ -1223,11 +1271,13 @@ actions:
                             {{ not schedule_state.active and opening_command_available and motor_open_allowed
                                and readings.valid and readings.high and not readings.recovered
                                and readings.temperature < reopening_temperature | float
-                               and is_state(current_window, 'closed')
-                               and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
-                               and as_timestamp(now())
+                               and (take_open_window or (is_state(current_window, 'closed')
+                                    and (motion_position_sensor | length == 0
+                                         or (is_number(motion_position) and motion_position | float == 0))
+                                    and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
+                                    and as_timestamp(now())
                                    - as_timestamp(states[current_window].last_changed, as_timestamp(now()))
-                                   >= cold_ventilation_pause | float * 60 }}
+                                   >= cold_ventilation_pause | float * 60)) }}
                       sequence:
                         - variables:
                             cold_opened_windows: "{{ cold_opened_windows + [current_window] }}"
@@ -1294,6 +1344,15 @@ actions:
                                           continue_on_error: true
                                           target:
                                             entity_id: "{{ current_window }}"
+                                        - variables:
+                                            automatic_windows: >-
+                                              {{ dict(automatic_windows.items() | list + [(current_window,
+                                                   dict(periodic=schedule_state.active,
+                                                        opening_failed=false,
+                                                        ends_at=schedule_state.ends_at if schedule_state.active else 0,
+                                                        opened_at=as_timestamp(now()),
+                                                        context=states[current_window].context.id
+                                                           if states[current_window].context is defined else ''))]) }}
                                   default:
                                     - variables:
                                         ventilation_status: "Открытие не выполнено: не удалось установить лимит {{ opening_entity }}"
@@ -1396,12 +1455,10 @@ actions:
           variables:
             periodic_active: "{{ schedule_state.active }}"
             periodic_close_due: >-
-              {{ control_mode != 'sensors' and not periodic_active
-                 and (control_mode == 'periodic'
-                      or ((verification_in_progress | default(false) or motion_verification_in_progress)
-                          and current_window in scheduled_close_windows)
-                      or (schedule_state.closing_due and trigger is defined
-                          and trigger.id | default('') in ['periodic_check', 'schedule_check']))
+              {{ current_window in automatic_windows
+                 and automatic_windows[current_window].periodic
+                 and as_timestamp(now()) >= automatic_windows[current_window].ends_at
+                 and not periodic_active
                  and not (verification_in_progress | default(false) and not motion_verification_in_progress
                           and current_window in closing_cycles
                           and states(current_window) in ['open', 'opening']
@@ -1411,16 +1468,16 @@ actions:
               {{ state_attr(current_window, 'supported_features') | int(0) | bitwise_and(4) != 0
                  and is_number(current_position) and 0 <= current_position | float <= 100 }}
             full_close_required: >-
-              {{ not periodic_active and (periodic_close_due
-                 or (control_mode != 'periodic' and (
-                      not readings.valid
-                      or readings.recovered
-                      or (readings.temperature <= minimum_temperature | float
-                          and (cold_close_delay | float == 0
-                               or (current_window in cold_wait_expired
-                                   and (states(current_window) in ['closed', 'closing']
-                                        or as_timestamp(states[current_window].last_changed, 0)
-                                           == cold_wait_expired[current_window]))))))) }}
+              {% set owned = current_window in automatic_windows %}
+              {% set protected_periodic = owned and automatic_windows[current_window].periodic and periodic_active %}
+              {% set cold_expired = current_window in cold_wait_expired
+                 and (states(current_window) in ['closed', 'closing']
+                      or as_timestamp(states[current_window].last_changed, 0) == cold_wait_expired[current_window]) %}
+              {% set cold_due = is_number(readings.temperature) and readings.temperature <= minimum_temperature | float
+                 and (cold_close_delay | float == 0 or cold_expired) %}
+              {{ not protected_periodic and (periodic_close_due
+                 or (owned and control_mode != 'periodic' and (not readings.valid or readings.recovered))
+                 or cold_due) }}
         - &dispatch_window_command
           choose:
             - conditions:
@@ -1429,6 +1486,9 @@ actions:
                   value_template: >-
                     {{ full_close_required
                        and (not parallel_feedback_run
+                            or current_window in cold_wait_expired
+                            or (is_number(readings.temperature) and readings.temperature <= minimum_temperature | float
+                                and cold_close_delay | float == 0)
                             or (periodic_close_due and schedule_state.closing_due
                                 and states(current_window) in ['open', 'opening']))
                        and (states(current_window) in ['open', 'opening']
@@ -1447,6 +1507,7 @@ actions:
               sequence:
                 - variables:
                     motion_kind: close
+                    auto_closing_windows: "{{ auto_closing_windows + [current_window] }}"
                     closing_cycles: >-
                       {{ dict(closing_cycles.items() | list
                            + [(current_window, as_timestamp(states[current_window].last_changed, 0))]) }}
@@ -1472,8 +1533,12 @@ actions:
                   alias: "Открыть окно в текущем интервале расписания"
                   value_template: >-
                     {{ periodic_active and opening_command_available and motor_open_allowed
-                       and (states(current_window) in ['closed', 'closing']
-                            or (is_state(current_window, 'open')
+                       and (take_open_window or (is_state(current_window, 'closed')
+                             and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
+                             and (motion_position_sensor | length == 0
+                                  or (is_number(motion_position) and motion_position | float == 0)))
+                            or (current_window in automatic_windows and not automatic_windows[current_window].opening_failed
+                                and is_state(current_window, 'open')
                                 and (opening_position_mismatch
                                      or (opening_entity | length > 0 and not opening_level_matches)
                                      or (opening_entity | length == 0 and position_available
@@ -1494,12 +1559,32 @@ actions:
                        and opening_command_available and motor_open_allowed and window_action == 'open'
                        and readings.valid and readings.high and not readings.recovered
                        and readings.temperature >= reopening_temperature | float
-                       and (states(current_window) in ['closed', 'closing']
-                            or (is_state(current_window, 'open')
+                       and (take_open_window or (is_state(current_window, 'closed')
+                             and (contact_sensor | length == 0 or is_state(contact_sensor, 'off'))
+                             and (motion_position_sensor | length == 0
+                                  or (is_number(motion_position) and motion_position | float == 0)))
+                            or (current_window in automatic_windows and not automatic_windows[current_window].opening_failed
+                                and is_state(current_window, 'open')
                                 and (opening_position_mismatch
                                      or (opening_entity | length > 0 and not opening_level_matches)))) }}
               sequence:
                 - *open_ventilation_window
+
+        - choose:
+            - conditions:
+                - condition: template
+                  alias: "Ручное открытие сохраняется до закрытия по холоду"
+                  value_template: >-
+                    {{ current_window not in automatic_windows and not full_close_required
+                       and state_attr(this.entity_id, 'current') | int(0) <= 1
+                       and (states(current_window) in ['open', 'opening']
+                            or (is_number(motion_position) and motion_position | float > 0)) }}
+              sequence:
+                - variables:
+                    ventilation_status: >-
+                      Ручное открытие: {{ current_window }}.
+                      Автоматическое закрытие — только по холоду с задержкой {{ cold_close_delay }} мин
+                - *publish_status
 
         - alias: "Удалить неактуальное уведомление о закрытии"
           choose:
@@ -1570,19 +1655,20 @@ actions:
   # Запоминаем состояние каждого окна перед ожиданием закрытия по холоду:
   # ожидание предыдущего открытия не должно закрыть следующий цикл.
   # Обычные обновления датчиков не запускают дополнительные ожидания.
-  - variables:
+  - &prepare_cold_wait
+    variables:
+      allow_cycle_takeover: false
       cold_wait_started_at: "{{ as_timestamp(now()) }}"
       cold_wait_windows: >-
         {% set ns = namespace(items=[]) %}
         {% set event_id = trigger.id | default('') if trigger is defined else '' %}
-        {% set can_start = trigger is not defined or cold_opened_windows | count > 0
+        {% set can_start = automatic_monitoring or trigger is not defined or cold_opened_windows | count > 0
            or event_id in ['room_cold_or_unavailable', 'startup']
            or (event_id == 'periodic_check' and now().minute % 5 == 0)
            or (event_id == 'window_changed' and trigger.to_state is defined and trigger.to_state is not none
                and trigger.to_state.state in ['open', 'opening']) %}
-        {% if control_mode != 'periodic' and not schedule_state.active
-           and can_start and cold_close_delay | float > 0
-           and readings.valid and not readings.recovered
+        {% if can_start and cold_close_delay | float > 0
+           and is_number(readings.temperature)
            and readings.temperature <= minimum_temperature | float %}
           {% for window in windows | unique %}
             {% if (states(window) in ['open', 'opening']
@@ -1590,7 +1676,8 @@ actions:
                         and states(feedback[window].position) | float > 0)
                     or (is_state(window, 'closed') and window in contacts
                         and not is_state(contacts[window], 'off')))
-               and (event_id != 'window_changed' or trigger.entity_id | default('') == window
+               and not (window in automatic_windows and automatic_windows[window].periodic and schedule_state.active)
+               and (automatic_monitoring or event_id != 'window_changed' or trigger.entity_id | default('') == window
                     or window in cold_opened_windows) %}
               {% set ns.items = ns.items + [(window, as_timestamp(states[window].last_changed, 0))] %}
             {% endif %}
@@ -1708,7 +1795,8 @@ actions:
                             {% if motion_request.motion == 'close' %}
                               {{ full_close_required }}
                             {% else %}
-                              {{ not full_close_required and opening_command_available
+                              {{ current_window in automatic_windows
+                                 and not full_close_required and opening_command_available
                                  and not (current_window in cold_wait_windows
                                           and as_timestamp(now()) >= cold_wait_started_at + cold_close_delay | float * 60)
                                  and opening_entity == motion_request.limit
@@ -1729,6 +1817,7 @@ actions:
                             sequence:
                               - variables:
                                   motion_kind: close
+                                  auto_closing_windows: "{{ auto_closing_windows + [current_window] }}"
                                   scheduled_close_windows: >-
                                     {{ scheduled_close_windows + [current_window]
                                        if periodic_close_due else scheduled_close_windows }}
@@ -1870,63 +1959,84 @@ actions:
                         title: "Проветривание: движение окна не подтверждено"
                         message: "{{ ventilation_status }} Повторов: {{ motion_attempts[motion_request.motion] }}."
         - variables:
+            automatic_windows: >-
+              {{ dict(automatic_windows.items() | list + [(current_window,
+                   dict(automatic_windows[current_window], opening_failed=true))])
+                 if current_window in automatic_windows and motion_request.motion == 'open'
+                    and not motion_success and not motion_cancelled else automatic_windows }}
             motion_processed: >-
               {{ dict(motion_processed.items() | list + [(current_window,
                    [motion_request.motion, motion_request.sent_at])]) }}
             motion_verification_in_progress: false
 
-  - alias: "Выдержать задержку закрытия по холоду"
+  - &await_cold_close
+    alias: "Выдержать задержку закрытия по холоду"
     choose:
       - conditions:
           - condition: template
             alias: "Открытые окна требуют задержки закрытия"
             value_template: "{{ cold_wait_windows | count > 0 }}"
         sequence:
-          - wait_for_trigger:
-              - trigger: template
-                value_template: *air_recovered_condition
-              - trigger: template
-                value_template: *air_unavailable_condition
-              - trigger: template
-                value_template: >-
-                  {% set ns = namespace(values=[], valid=true) %}
-                  {% set sensors = selected_temperature_sensors %}
-                  {% if sensors | count == 0 %}
-                    {% set sensors = area_entities(selected_area)
-                       | select('match', '^sensor[.]')
-                       | select('is_state_attr', 'device_class', 'temperature') | list %}
-                  {% endif %}
-                  {% for entity in sensors %}
-                    {% set value = states(entity) %}
-                    {% set unit = state_attr(entity, 'unit_of_measurement') %}
-                    {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
-                      {% set ns.valid = false %}
-                    {% else %}
-                      {% set value = value | float %}
-                      {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
-                         else value - 273.15 if unit == 'K' else value %}
-                      {% set ns.values = ns.values + [celsius | round(3)] %}
-                    {% endif %}
-                  {% endfor %}
-                  {{ not ns.valid or ns.values | count == 0
-                     or ns.values | min > minimum_temperature | float }}
-              - trigger: template
-                value_template: >-
-                  {% set ns = namespace(pending=false) %}
-                  {% for window, opened_at in cold_wait_windows.items() %}
-                    {% if (states(window) in ['open', 'opening']
-                           or (window in feedback and is_number(states(feedback[window].position))
-                               and states(feedback[window].position) | float > 0)
-                           or (is_state(window, 'closed') and window in contacts
-                               and not is_state(contacts[window], 'off')))
-                       and as_timestamp(states[window].last_changed, 0) == opened_at %}
-                      {% set ns.pending = true %}
-                    {% endif %}
-                  {% endfor %}
-                  {{ not ns.pending }}
-            timeout:
-              seconds: "{{ [0, cold_close_delay | float * 60 - (as_timestamp(now()) - cold_wait_started_at)] | max }}"
-            continue_on_timeout: true
+          - choose:
+              - conditions:
+                  - condition: template
+                    alias: "Для своего автоматического цикла учитывать восстановление воздуха"
+                    value_template: "{{ automatic_windows | count > 0 }}"
+                sequence:
+                  - wait_for_trigger:
+                      - trigger: template
+                        value_template: *air_recovered_condition
+                      - trigger: template
+                        value_template: *air_unavailable_condition
+                      - trigger: template
+                        value_template: &cold_released >-
+                          {% set ns = namespace(values=[], valid=true) %}
+                          {% set sensors = selected_temperature_sensors %}
+                          {% if sensors | count == 0 %}
+                            {% set sensors = area_entities(selected_area)
+                               | select('match', '^sensor[.]')
+                               | select('is_state_attr', 'device_class', 'temperature') | list %}
+                          {% endif %}
+                          {% for entity in sensors %}
+                            {% set value = states(entity) %}
+                            {% set unit = state_attr(entity, 'unit_of_measurement') %}
+                            {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+                              {% set ns.valid = false %}
+                            {% else %}
+                              {% set value = value | float %}
+                              {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+                                 else value - 273.15 if unit == 'K' else value %}
+                              {% set ns.values = ns.values + [celsius | round(3)] %}
+                            {% endif %}
+                          {% endfor %}
+                          {{ not ns.valid or ns.values | count == 0
+                             or ns.values | min > minimum_temperature | float }}
+                      - trigger: template
+                        value_template: &cold_cycle_ended >-
+                          {% set ns = namespace(pending=false) %}
+                          {% for window, opened_at in cold_wait_windows.items() %}
+                            {% if (states(window) in ['open', 'opening']
+                                   or (window in feedback and is_number(states(feedback[window].position))
+                                       and states(feedback[window].position) | float > 0)
+                                   or (is_state(window, 'closed') and window in contacts
+                                       and not is_state(contacts[window], 'off')))
+                               and as_timestamp(states[window].last_changed, 0) == opened_at %}
+                              {% set ns.pending = true %}
+                            {% endif %}
+                          {% endfor %}
+                          {{ not ns.pending }}
+                    timeout:
+                      seconds: "{{ [0, cold_close_delay | float * 60 - (as_timestamp(now()) - cold_wait_started_at)] | max }}"
+                    continue_on_timeout: true
+            default:
+              - wait_for_trigger:
+                  - trigger: template
+                    value_template: *cold_released
+                  - trigger: template
+                    value_template: *cold_cycle_ended
+                timeout:
+                  seconds: "{{ [0, cold_close_delay | float * 60 - (as_timestamp(now()) - cold_wait_started_at)] | max }}"
+                continue_on_timeout: true
           - variables:
               cold_wait_expired: "{{ cold_wait_windows if not wait.completed else {} }}"
           - *refresh_temperature_entities
@@ -1949,7 +2059,8 @@ actions:
 
   # Сначала команды отправлены всем окнам, затем проверяем контакты.
   # Ожидание одного датчика не задерживает первоначальное закрытие остальных.
-  - repeat:
+  - &verify_contact_requests
+    repeat:
       for_each: "{{ closing_requests | reject('in', feedback.keys() | list) | list }}"
       sequence:
         - variables:
@@ -2027,3 +2138,112 @@ actions:
 
   # Закрытие по холоду могло заменить уже проверенную команду открытия.
   - *verify_motion_requests
+
+  # Владение хранится только внутри запустившего проветривание сценария.
+  # Другие запуски не закрывают открытое вручную окно по CO₂/TVOC или cron.
+  - variables:
+      automatic_monitoring: true
+      monitor_last_air_high: "{{ readings.high }}"
+  - repeat:
+      while:
+        - condition: template
+          value_template: "{{ automatic_windows | count > 0 }}"
+      sequence:
+        - variables:
+            automatic_windows: >-
+              {% set ns = namespace(items=[]) %}
+              {% for window, owned in automatic_windows.items() %}
+                {% if window not in auto_closing_windows and states(window) not in ['closed', 'closing'] %}
+                  {% set ns.items = ns.items + [(window, owned)] %}
+                {% endif %}
+              {% endfor %}
+              {{ dict(ns.items) }}
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: "{{ automatic_windows | count > 0 }}"
+              sequence:
+                - variables:
+                    automatic_wait_seconds: >-
+                      {% set ns = namespace(limits=[60]) %}
+                      {% for owned in automatic_windows.values() %}
+                        {% if owned.periodic %}
+                          {% set ns.limits = ns.limits + [[0, owned.ends_at - as_timestamp(now())] | max] %}
+                        {% endif %}
+                      {% endfor %}
+                      {{ ns.limits | min }}
+                - alias: "Дождаться окончания собственного цикла или ручного вмешательства"
+                  wait_template: >-
+                    {% set ns = namespace(wake=false, air_ok=true, recovered=true, high=false, temperatures=[]) %}
+                    {% for window, owned in automatic_windows.items() %}
+                      {% set state = states[window] %}
+                      {% set event = feedback.get(window, {}).get('event', '') %}
+                      {% if states(window) in ['closed', 'closing']
+                         or (owned.periodic and as_timestamp(now()) >= owned.ends_at)
+                         or (state.context is defined and state.context.user_id is not none
+                             and state.context.id != owned.context
+                             and as_timestamp(state.last_changed, 0) > owned.opened_at)
+                         or (event | length > 0 and is_state(event, 'External opening')
+                             and as_timestamp(states[event].last_changed, 0) > owned.opened_at) %}
+                        {% set ns.wake = true %}
+                      {% endif %}
+                    {% endfor %}
+                    {% for entity in co2_entities + tvoc_entities %}
+                      {% set value = states(entity) %}
+                      {% if not is_number(value) or value | float < 0 %}
+                        {% set ns.air_ok = false %}
+                      {% else %}
+                        {% set limit = co2_close if entity in co2_entities else tvoc_close %}
+                        {% set ns.recovered = ns.recovered and value | float <= limit | float %}
+                        {% set opening_limit = co2_open if entity in co2_entities else tvoc_open %}
+                        {% set ns.high = ns.high or value | float >= opening_limit | float %}
+                      {% endif %}
+                    {% endfor %}
+                    {% for entity in temperature_entities %}
+                      {% set value = states(entity) %}
+                      {% set unit = state_attr(entity, 'unit_of_measurement') %}
+                      {% if not is_number(value) or unit not in ['°C','°F','K'] %}
+                        {% set ns.air_ok = false %}
+                      {% else %}
+                        {% set value = value | float %}
+                        {% set ns.temperatures = ns.temperatures + [((value - 32) * 5 / 9 if unit == '°F'
+                           else value - 273.15 if unit == 'K' else value) | round(3)] %}
+                      {% endif %}
+                    {% endfor %}
+                    {% for owned in automatic_windows.values() %}
+                      {% if not owned.periodic and (not ns.air_ok or ns.recovered
+                         or ns.temperatures | count == 0 or ns.temperatures | min <= minimum_temperature | float) %}
+                        {% set ns.wake = true %}
+                      {% endif %}
+                    {% endfor %}
+                    {{ ns.wake or (control_mode != 'periodic' and ns.high != monitor_last_air_high) }}
+                  timeout:
+                    seconds: "{{ automatic_wait_seconds }}"
+                  continue_on_timeout: true
+                - *refresh_temperature_entities
+                - *refresh_readings
+                - *refresh_schedule
+                - *refresh_decision
+                - variables:
+                    closing_requests: []
+                    allow_cycle_takeover: true
+                    sensor_cycle_edge: "{{ readings.high and not monitor_last_air_high }}"
+                    monitor_last_air_high: "{{ readings.high }}"
+                - repeat:
+                    for_each: "{{ windows | unique | list }}"
+                    sequence:
+                      - variables:
+                          current_window: "{{ repeat.item }}"
+                          contact_sensor: "{{ contacts.get(current_window, '') }}"
+                      - *refresh_motion_feedback
+                      - *refresh_window_requirements
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ current_window in automatic_windows or take_open_window }}"
+                            sequence:
+                              - *dispatch_window_command
+                - *prepare_cold_wait
+                - *await_cold_close
+                - *verify_motion_requests
+                - *verify_contact_requests

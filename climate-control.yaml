@@ -1,15 +1,19 @@
 blueprint:
-  name: "Climate Controller v1"
+  name: "Climate Controller v2"
   description: >
     Климат: выключение при открытии окна/двери и восстановление при закрытии
     Отслеживает бинарный сенсор (например, датчик открытия окна или двери) и:
 
-      • при переходе в состояние "открыто" — выключает выбранные климатические
-        устройства (термостаты, кондиционеры), предварительно сохранив их
-        текущее состояние (режим, температуру, вентилятор и т.д.);
+      • при переходе в состояние "открыто" — сохраняет состояние и выключает
+        только включённые климатические устройства (термостаты, кондиционеры);
+        уже выключенные, неизвестные и недоступные устройства пропускаются;
 
-      • при переходе в состояние "закрыто" — восстанавливает климатические
-        устройства ровно в то состояние, в котором они были до выключения.
+      • при переходе в состояние "закрыто" — восстанавливает сценой только
+        устройства, сохранённые при открытии, и удаляет использованный снимок.
+
+    Если при открытии все устройства уже выключены, команды выключения
+    и восстановления им не отправляются. Старый снимок удаляется перед
+    новым циклом, чтобы не восстановить состояние предыдущего проветривания.
 
     Для каждого из двух событий можно задать дополнительные произвольные
     действия (actions), которые выполнятся после основного шага.
@@ -132,13 +136,30 @@ action:
           - condition: trigger
             id: "opened"
         sequence:
-          - action: scene.create
-            data:
-              scene_id: "{{ scene_id }}"
-              snapshot_entities: "{{ climate_entities }}"
-          - action: climate.turn_off
-            target:
-              entity_id: "{{ climate_entities }}"
+          - variables:
+              active_climate_entities: >-
+                {{ expand(climate_entities)
+                   | selectattr('state', 'in', ['heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only'])
+                   | map(attribute='entity_id') | list }}
+          # Пустой новый цикл не должен использовать снимок предыдущего.
+          - if:
+              - condition: template
+                value_template: "{{ states['scene.' ~ scene_id] is not none }}"
+            then:
+              - action: scene.delete
+                target:
+                  entity_id: "scene.{{ scene_id }}"
+          - if:
+              - condition: template
+                value_template: "{{ active_climate_entities | count > 0 }}"
+            then:
+              - action: scene.create
+                data:
+                  scene_id: "{{ scene_id }}"
+                  snapshot_entities: "{{ active_climate_entities }}"
+              - action: climate.turn_off
+                target:
+                  entity_id: "{{ active_climate_entities }}"
           - choose: []
             default: !input actions_after_off
 
@@ -147,9 +168,16 @@ action:
           - condition: trigger
             id: "closed"
         sequence:
-          - action: scene.turn_on
-            target:
-              entity_id: "scene.{{ scene_id }}"
+          - if:
+              - condition: template
+                value_template: "{{ states['scene.' ~ scene_id] is not none }}"
+            then:
+              - action: scene.turn_on
+                target:
+                  entity_id: "scene.{{ scene_id }}"
+              # Снимок одноразовый: повторное закрытие не отправит команды.
+              - action: scene.delete
+                target:
+                  entity_id: "scene.{{ scene_id }}"
           - choose: []
             default: !input actions_after_on
-

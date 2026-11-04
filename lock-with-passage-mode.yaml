@@ -7,6 +7,8 @@ blueprint:
     Также автоматически закрывает замок в момент окончания интервала
     прохода, если к этому моменту он остался открытым.
     Замок никогда не закрывается, пока дверь открыта.
+    Опционально запрашивает обновление состояния замка при открытии
+    и закрытии двери через homeassistant.update_entity (например, TTLock BLE).
   domain: automation
   homeassistant:
     min_version: 2024.10.0
@@ -24,6 +26,16 @@ blueprint:
         entity:
           domain: binary_sensor
           device_class: door
+    refresh_lock_on_door_change:
+      name: Обновлять статус замка при изменении двери
+      description: >
+        Запрашивает состояние замка при открытии и закрытии двери,
+        в том числе в Passage Mode. Использует homeassistant.update_entity:
+        интеграция замка должна поддерживать принудительное обновление
+        (например, TTLock BLE). Ошибка запроса не отключает автозакрытие.
+      default: false
+      selector:
+        boolean: {}
     lock_delay:
       name: Задержка перед закрытием
       description: >
@@ -99,43 +111,32 @@ blueprint:
           selector:
             time: {}
 
-# single: периодическая проверка / конец интервала не прерывают ожидание
-# задержки и не обходят её.
-mode: single
+# Задержка выполняется триггером, поэтому обновление статуса не блокирует
+# обработку открытий/закрытий двери. BLE-запросы и команды выполняются по очереди.
+mode: queued
+max: 10
 max_exceeded: silent
 
 variables:
   passage_start: !input passage_start_time
   passage_end: !input passage_end_time
   passage_days: !input passage_weekdays
-  # Для ночного интервала после полуночи проверяем день его начала.
-  passage_active: >-
-    {% set current = now() %}
-    {% set start = today_at(passage_start) %}
-    {% set end = today_at(passage_end) %}
-    {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
-    {% if start > end %}
-      {% if current < end %}
-        {% set start = start - timedelta(days=1) %}
-      {% else %}
-        {% set end = end + timedelta(days=1) %}
-      {% endif %}
-    {% endif %}
-    {{ weekdays[start.weekday()] in passage_days and start <= current < end }}
-  # Триггер времени срабатывает каждый день; закрываем только в конце
-  # интервала, который начался в выбранный день недели.
-  passage_end_scheduled: >-
-    {% set start = today_at(passage_start) %}
-    {% set end = today_at(passage_end) %}
-    {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
-    {% set start_day = (now().weekday() - (1 if start > end else 0)) % 7 %}
-    {{ start != end and weekdays[start_day] in passage_days }}
+  door_entity: !input door_sensor
+  close_delay: !input lock_delay
+  refresh_lock_state: !input refresh_lock_on_door_change
 
 triggers:
   - trigger: state
     entity_id: !input door_sensor
+    from: ["on", "off"]
+    to: ["on", "off"]
+    id: door_changed
+  - trigger: state
+    entity_id: !input door_sensor
     from: "on"
     to: "off"
+    for:
+      seconds: !input lock_delay
     id: door_closed
   - trigger: time
     at: !input passage_end_time
@@ -148,6 +149,57 @@ conditions: []
 
 actions:
   - choose:
+      - conditions:
+          - condition: trigger
+            id: door_changed
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ refresh_lock_state }}"
+            then:
+              - action: homeassistant.update_entity
+                continue_on_error: true
+                target:
+                  entity_id: !input lock_entity
+          - stop: "Изменение двери обработано; автозакрытие запускается после задержки"
+
+  # Проверяем состояние непосредственно перед решением о блокировке:
+  # пока BLE-запрос ждал в очереди, дверь могли открыть и закрыть снова.
+  - condition: state
+    entity_id: !input door_sensor
+    state: "off"
+  - condition: template
+    alias: "Дверь непрерывно закрыта не меньше заданной задержки"
+    value_template: >-
+      {{ as_timestamp(now()) - as_timestamp(states[door_entity].last_changed)
+         >= close_delay | float }}
+
+  # Режим прохода вычисляется при выполнении, после ожидания в очереди.
+  - variables:
+      # Для ночного интервала после полуночи проверяем день его начала.
+      passage_active: >-
+        {% set current = now() %}
+        {% set start = today_at(passage_start) %}
+        {% set end = today_at(passage_end) %}
+        {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+        {% if start > end %}
+          {% if current < end %}
+            {% set start = start - timedelta(days=1) %}
+          {% else %}
+            {% set end = end + timedelta(days=1) %}
+          {% endif %}
+        {% endif %}
+        {{ weekdays[start.weekday()] in passage_days and start <= current < end }}
+      # Триггер времени срабатывает каждый день; закрываем только в конце
+      # интервала, который начался в выбранный день недели.
+      passage_end_scheduled: >-
+        {% set start = today_at(passage_start) %}
+        {% set end = today_at(passage_end) %}
+        {% set weekdays = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+        {% set start_day = (now().weekday() - (1 if start > end else 0)) % 7 %}
+        {{ start != end and weekdays[start_day] in passage_days }}
+
+  - choose:
       # Сценарий 1: дверь закрылась и мы не в интервале прохода
       - conditions:
           - condition: trigger
@@ -155,12 +207,6 @@ actions:
           - condition: template
             value_template: "{{ not passage_active }}"
         sequence:
-          - delay:
-              seconds: !input lock_delay
-          # дверь могли снова открыть за время задержки
-          - condition: state
-            entity_id: !input door_sensor
-            state: "off"
           - action: lock.lock
             target:
               entity_id: !input lock_entity
@@ -176,9 +222,6 @@ actions:
           - condition: state
             entity_id: !input lock_entity
             state: "unlocked"
-          - condition: state
-            entity_id: !input door_sensor
-            state: "off"
         sequence:
           - action: lock.lock
             target:
@@ -192,9 +235,6 @@ actions:
           - condition: state
             entity_id: !input lock_entity
             state: "unlocked"
-          - condition: state
-            entity_id: !input door_sensor
-            state: "off"
           - condition: template
             value_template: "{{ not passage_active }}"
         sequence:

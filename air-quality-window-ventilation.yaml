@@ -2,17 +2,19 @@ blueprint:
   name: "Air Quality Window Ventilation"
   description: >-
     Открывает выбранные окна при превышении порога CO₂ или TVOC,
-    если температура позволяет проветривание. Закрывает окна, когда
-    все показатели воздуха снизятся до порогов закрытия.
+    если температура позволяет проветривание. Закрывает автоматически
+    открытые окна, когда все показатели воздуха снизятся до порогов закрытия.
 
     Если температура остаётся ниже заданного порога, окна закрываются
     после указанной задержки, даже при высоких CO₂/TVOC. Прогрев отменяет
     отсчёт. Изменения CO₂/TVOC не сбрасывают задержку.
 
-    При недоступных показаниях окна закрываются. Управление распространяется
-    на все выбранные окна, в том числе открытые вручную.
+    Окна, открытые вручную, закрываются по температуре с указанной задержкой.
+    Нормальные CO₂/TVOC не закрывают их и не отменяют температурный таймер.
+    При недоступных показаниях закрываются все выбранные окна.
     После перезапуска Home Assistant или перезагрузки автоматизации
-    задержка по температуре отсчитывается заново. Помощник таймера не нужен.
+    открытые окна считаются ручными, задержка по температуре отсчитывается
+    заново. Помощник таймера не нужен.
     Причины команд открытия и закрытия записываются в Activity выбранного окна.
     После каждой команды устройству выдерживается пауза 1 секунда.
   domain: automation
@@ -258,6 +260,7 @@ conditions:
 actions:
   - variables:
       cold_since: 0
+      automatic_windows: []
   - repeat:
       while:
         - condition: template
@@ -320,6 +323,7 @@ actions:
             open_windows: >-
               {{ windows | select('is_state', 'open') | list
                  + windows | select('is_state', 'opening') | list }}
+            automatic_windows: "{{ automatic_windows | select('in', open_windows) | list }}"
             cold_since: >-
               {{ (cold_since if cold_since | float > 0 else as_timestamp(now()))
                  if readings.valid and readings.temperature <= minimum_temperature | float
@@ -327,15 +331,18 @@ actions:
             cold_close_due: >-
               {{ cold_since | float > 0
                  and as_timestamp(now()) - cold_since | float >= cold_close_delay | float * 60 }}
+            close_windows: >-
+              {{ open_windows if not readings.valid or cold_close_due
+                 else automatic_windows if readings.recovered else [] }}
 
         - choose:
             - conditions:
                 - condition: template
                   alias: "Воздух нормализовался, показания потеряны или истекла задержка по холоду"
-                  value_template: "{{ not readings.valid or readings.recovered or cold_close_due }}"
+                  value_template: "{{ close_windows | count > 0 }}"
               sequence:
                 - repeat:
-                    for_each: "{{ open_windows }}"
+                    for_each: "{{ close_windows }}"
                     sequence:
                       - action: logbook.log
                         continue_on_error: true
@@ -347,11 +354,11 @@ actions:
                             Команда закрытия:
                             {% if not readings.valid %}
                               недоступные или некорректные показания датчиков воздуха или температуры.
-                            {% elif readings.recovered %}
-                              все выбранные показатели CO₂/TVOC снизились до порогов закрытия.
-                            {% else %}
+                            {% elif cold_close_due %}
                               температура {{ readings.temperature }} °C ≤ {{ minimum_temperature }} °C
                               в течение {{ cold_close_delay }} мин.
+                            {% else %}
+                              все выбранные показатели CO₂/TVOC снизились до порогов закрытия.
                             {% endif %}
                       - action: cover.close_cover
                         continue_on_error: true
@@ -359,7 +366,11 @@ actions:
                           entity_id: "{{ repeat.item }}"
                       - delay:
                           seconds: 1
-                - stop: "Проветривание завершено"
+                - if:
+                    - condition: template
+                      value_template: "{{ close_windows | count == open_windows | count }}"
+                  then:
+                    - stop: "Проветривание завершено"
 
             - conditions:
                 - condition: template
@@ -394,6 +405,8 @@ actions:
                           message: >-
                             Команда открытия: {{ readings.high_sources | join('; ') }}.
                             Температура {{ readings.temperature }} °C ≥ {{ reopening_temperature }} °C.
+                      - variables:
+                          automatic_windows: "{{ (automatic_windows + [repeat.item]) | unique | list }}"
                       - action: cover.open_cover
                         continue_on_error: true
                         target:

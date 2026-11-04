@@ -13,6 +13,7 @@ blueprint:
     на все выбранные окна, в том числе открытые вручную.
     После перезапуска Home Assistant или перезагрузки автоматизации
     задержка по температуре отсчитывается заново. Помощник таймера не нужен.
+    Причины команд открытия и закрытия записываются в Activity выбранного окна.
   domain: automation
   homeassistant:
     min_version: 2025.9.0
@@ -270,7 +271,7 @@ actions:
             observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + windows) | unique | list }}"
             observed_states: "{{ observed_entities | map('states') | list }}"
             readings: >-
-              {% set ns = namespace(valid=true, high=false, recovered=true,
+              {% set ns = namespace(valid=true, high=false, recovered=true, high_sources=[],
                                     temperatures=[], tvoc_units=[]) %}
               {% for entity in co2_entities + tvoc_entities %}
                 {% set value = states(entity) %}
@@ -282,11 +283,19 @@ actions:
                   {% if entity in co2_entities %}
                     {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
                     {% set ns.high = ns.high or value >= co2_open | float %}
+                    {% if value >= co2_open | float %}
+                      {% set ns.high_sources = ns.high_sources
+                         + ['CO₂ (' ~ entity ~ '): ' ~ value ~ ' ppm ≥ ' ~ co2_open ~ ' ppm'] %}
+                    {% endif %}
                     {% set ns.recovered = ns.recovered and value <= co2_close | float %}
                   {% endif %}
                   {% if entity in tvoc_entities %}
                     {% set ns.tvoc_units = ns.tvoc_units + [unit] %}
                     {% set ns.high = ns.high or value >= tvoc_open | float %}
+                    {% if value >= tvoc_open | float %}
+                      {% set ns.high_sources = ns.high_sources
+                         + ['TVOC (' ~ entity ~ '): ' ~ value ~ ' ≥ ' ~ tvoc_open ~ ' ' ~ (unit or '')] %}
+                    {% endif %}
                     {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
                   {% endif %}
                 {% endif %}
@@ -305,7 +314,7 @@ actions:
               {% endfor %}
               {{ dict(valid=ns.valid and ns.temperatures | count > 0
                            and ns.tvoc_units | unique | list | count <= 1,
-                      high=ns.high, recovered=ns.recovered,
+                      high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
                       temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
             open_windows: >-
               {{ windows | select('is_state', 'open') | list
@@ -327,6 +336,22 @@ actions:
                 - repeat:
                     for_each: "{{ open_windows }}"
                     sequence:
+                      - action: logbook.log
+                        continue_on_error: true
+                        data:
+                          name: "{{ state_attr(this.entity_id, 'friendly_name') or 'Проветривание' }}"
+                          entity_id: "{{ repeat.item }}"
+                          domain: cover
+                          message: >-
+                            Команда закрытия:
+                            {% if not readings.valid %}
+                              недоступные или некорректные показания датчиков воздуха или температуры.
+                            {% elif readings.recovered %}
+                              все выбранные показатели CO₂/TVOC снизились до порогов закрытия.
+                            {% else %}
+                              температура {{ readings.temperature }} °C ≤ {{ minimum_temperature }} °C
+                              в течение {{ cold_close_delay }} мин.
+                            {% endif %}
                       - action: cover.close_cover
                         continue_on_error: true
                         target:
@@ -355,6 +380,15 @@ actions:
                 - repeat:
                     for_each: "{{ closed_windows }}"
                     sequence:
+                      - action: logbook.log
+                        continue_on_error: true
+                        data:
+                          name: "{{ state_attr(this.entity_id, 'friendly_name') or 'Проветривание' }}"
+                          entity_id: "{{ repeat.item }}"
+                          domain: cover
+                          message: >-
+                            Команда открытия: {{ readings.high_sources | join('; ') }}.
+                            Температура {{ readings.temperature }} °C ≥ {{ reopening_temperature }} °C.
                       - action: cover.open_cover
                         continue_on_error: true
                         target:

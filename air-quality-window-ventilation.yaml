@@ -1,17 +1,24 @@
 blueprint:
   name: "Air Quality Window Ventilation"
   description: >-
-    Открывает выбранные окна при превышении порога CO₂ или TVOC,
-    если температура позволяет проветривание. Закрывает автоматически
-    открытые окна, когда все показатели воздуха снизятся до порогов закрытия.
+    По CO₂/TVOC: открывает закрытые окна при превышении порога любого
+    датчика, если температура позволяет проветривание. При снижении всех
+    показателей до порогов закрытия закрывает только окна, открытые этой
+    автоматизацией. На уже открытые вручную окна показания CO₂/TVOC не влияют.
 
-    Если температура остаётся ниже заданного порога, окна закрываются
-    после указанной задержки, даже при высоких CO₂/TVOC. Прогрев отменяет
-    отсчёт. Изменения CO₂/TVOC не сбрасывают задержку.
+    По температуре: если температура остаётся ниже заданного порога,
+    закрывает окна после указанной задержки, включая открытые вручную.
+    Для каждого окна время отсчитывается отдельно с момента похолодания
+    или его открытия в уже холодной комнате. Прогрев отменяет отсчёт.
+    Изменения CO₂/TVOC не сбрасывают температурную задержку.
 
     Окна, открытые вручную, закрываются по температуре с указанной задержкой.
     Нормальные CO₂/TVOC не закрывают их и не отменяют температурный таймер.
-    При недоступных показаниях закрываются все выбранные окна.
+    Недоступные или некорректные показания блокируют новое открытие,
+    но сами по себе не закрывают окно. Закрытие по CO₂/TVOC требует
+    корректных показаний всех датчиков воздуха; температурный таймер
+    зависит только от датчиков температуры. При потере температуры
+    отсчёт сбрасывается и начинается заново после восстановления показаний.
     После перезапуска Home Assistant или перезагрузки автоматизации
     открытые окна считаются ручными, задержка по температуре отсчитывается
     заново. Помощник таймера не нужен.
@@ -259,7 +266,7 @@ conditions:
 
 actions:
   - variables:
-      cold_since: 0
+      cold_since: {}
       automatic_windows: []
   - repeat:
       while:
@@ -275,17 +282,24 @@ actions:
             observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + windows) | unique | list }}"
             observed_states: "{{ observed_entities | map('states') | list }}"
             readings: >-
-              {% set ns = namespace(valid=true, high=false, recovered=true, high_sources=[],
+              {% set ns = namespace(air_valid=true, temperature_valid=true, errors=[],
+                                    high=false, recovered=true, high_sources=[],
                                     temperatures=[], tvoc_units=[]) %}
               {% for entity in co2_entities + tvoc_entities %}
                 {% set value = states(entity) %}
                 {% set unit = state_attr(entity, 'unit_of_measurement') %}
                 {% if not is_number(value) or value | float < 0 %}
-                  {% set ns.valid = false %}
+                  {% set ns.air_valid = false %}
+                  {% set ns.errors = ns.errors
+                     + [entity ~ ': состояние «' ~ value ~ '», ожидалось неотрицательное число'] %}
                 {% else %}
                   {% set value = value | float %}
                   {% if entity in co2_entities %}
-                    {% if unit != 'ppm' %}{% set ns.valid = false %}{% endif %}
+                    {% if unit != 'ppm' %}
+                      {% set ns.air_valid = false %}
+                      {% set ns.errors = ns.errors
+                         + [entity ~ ': единица «' ~ (unit or 'не задана') ~ '», ожидалась ppm'] %}
+                    {% endif %}
                     {% set ns.high = ns.high or value >= co2_open | float %}
                     {% if value >= co2_open | float %}
                       {% set ns.high_sources = ns.high_sources
@@ -304,11 +318,23 @@ actions:
                   {% endif %}
                 {% endif %}
               {% endfor %}
+              {% if ns.tvoc_units | unique | list | count > 1 %}
+                {% set ns.errors = ns.errors
+                   + ['TVOC (' ~ (tvoc_entities | join(', ')) ~ '): разные единицы измерения — '
+                      ~ (ns.tvoc_units | map('string') | unique | join(', '))] %}
+              {% endif %}
+              {% if temperature_entities | count == 0 %}
+                {% set ns.errors = ns.errors
+                   + ['Датчики температуры не выбраны и не найдены в Area «' ~ selected_area ~ '»'] %}
+              {% endif %}
               {% for entity in temperature_entities %}
                 {% set value = states(entity) %}
                 {% set unit = state_attr(entity, 'unit_of_measurement') %}
                 {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
-                  {% set ns.valid = false %}
+                  {% set ns.temperature_valid = false %}
+                  {% set ns.errors = ns.errors
+                     + [entity ~ ': состояние «' ~ value ~ '», единица «' ~ (unit or 'не задана')
+                        ~ '», ожидалась числовая температура в °C, °F или K'] %}
                 {% else %}
                   {% set value = value | float %}
                   {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
@@ -316,29 +342,42 @@ actions:
                   {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
                 {% endif %}
               {% endfor %}
-              {{ dict(valid=ns.valid and ns.temperatures | count > 0
-                           and ns.tvoc_units | unique | list | count <= 1,
-                      high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
+              {% set air_valid = ns.air_valid and co2_entities | count + tvoc_entities | count > 0
+                                 and ns.tvoc_units | unique | list | count <= 1 %}
+              {% set temperature_valid = ns.temperature_valid and ns.temperatures | count > 0 %}
+              {{ dict(valid=air_valid and temperature_valid,
+                      air_valid=air_valid, temperature_valid=temperature_valid,
+                      errors=ns.errors, high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
                       temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
             open_windows: >-
               {{ windows | select('is_state', 'open') | list
                  + windows | select('is_state', 'opening') | list }}
             automatic_windows: "{{ automatic_windows | select('in', open_windows) | list }}"
             cold_since: >-
-              {{ (cold_since if cold_since | float > 0 else as_timestamp(now()))
-                 if readings.valid and readings.temperature <= minimum_temperature | float
-                    and open_windows | count > 0 else 0 }}
-            cold_close_due: >-
-              {{ cold_since | float > 0
-                 and as_timestamp(now()) - cold_since | float >= cold_close_delay | float * 60 }}
+              {% set ns = namespace(items=[]) %}
+              {% if readings.temperature_valid and readings.temperature <= minimum_temperature | float %}
+                {% for window in open_windows %}
+                  {% set ns.items = ns.items + [(window, cold_since.get(window, as_timestamp(now())))] %}
+                {% endfor %}
+              {% endif %}
+              {{ dict(ns.items) }}
+            cold_close_windows: >-
+              {% set ns = namespace(windows=[]) %}
+              {% for window, started in cold_since.items() %}
+                {% if as_timestamp(now()) - started >= cold_close_delay | float * 60 %}
+                  {% set ns.windows = ns.windows + [window] %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.windows }}
             close_windows: >-
-              {{ open_windows if not readings.valid or cold_close_due
-                 else automatic_windows if readings.recovered else [] }}
+              {{ (cold_close_windows
+                  + (automatic_windows if readings.air_valid and readings.recovered else []))
+                 | unique | list }}
 
         - choose:
             - conditions:
                 - condition: template
-                  alias: "Воздух нормализовался, показания потеряны или истекла задержка по холоду"
+                  alias: "Воздух нормализовался или истекла задержка по холоду"
                   value_template: "{{ close_windows | count > 0 }}"
               sequence:
                 - repeat:
@@ -352,9 +391,7 @@ actions:
                           domain: cover
                           message: >-
                             Команда закрытия:
-                            {% if not readings.valid %}
-                              недоступные или некорректные показания датчиков воздуха или температуры.
-                            {% elif cold_close_due %}
+                            {% if repeat.item in cold_close_windows %}
                               температура {{ readings.temperature }} °C ≤ {{ minimum_temperature }} °C
                               в течение {{ cold_close_delay }} мин.
                             {% else %}
@@ -376,7 +413,7 @@ actions:
                 - condition: template
                   alias: "Воздух требует проветривания и комната прогрета"
                   value_template: >-
-                    {{ readings.high and readings.temperature >= reopening_temperature | float
+                    {{ readings.valid and readings.high and readings.temperature >= reopening_temperature | float
                        and windows | select('is_state', 'closed') | list | count > 0 }}
               sequence:
                 - variables:
@@ -426,7 +463,12 @@ actions:
             {{ observed_entities | map('states') | list != observed_states }}
           timeout:
             seconds: >-
-              {{ [1, [60, cold_close_delay | float * 60
-                          - (as_timestamp(now()) - cold_since | float)] | min] | max
-                 if cold_since | float > 0 else 60 }}
+              {% set ns = namespace(delays=[60]) %}
+              {% for started in cold_since.values() %}
+                {% set remaining = cold_close_delay | float * 60 - (as_timestamp(now()) - started) %}
+                {% if remaining > 0 %}
+                  {% set ns.delays = ns.delays + [remaining] %}
+                {% endif %}
+              {% endfor %}
+              {{ [1, ns.delays | min] | max }}
           continue_on_timeout: true

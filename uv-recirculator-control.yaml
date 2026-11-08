@@ -1,0 +1,246 @@
+blueprint:
+  name: "UV Recirculator Presence and Schedule Control"
+  description: >-
+    Управляет закрытым UV-рециркулятором через умную розетку по присутствию
+    и периодическому расписанию.
+
+    При обнаружении присутствия розетка включается независимо от расписания.
+    После окончания присутствия рециркулятор продолжает работать в течение
+    заданного времени и выключается, только если в этот момент не идёт
+    запланированный цикл. Повторное присутствие отменяет ожидаемое выключение.
+
+    Запланированные циклы работают независимо от присутствия: задайте интервал
+    между началами включений, длительность работы и временной диапазон. Циклы
+    отсчитываются от начала расписания каждый день. Ночной диапазон
+    может проходить через полночь. Одинаковые начало и конец разрешают
+    круглосуточное расписание.
+
+    Недоступное или неизвестное состояние датчика присутствия не выключает
+    розетку, но запланированные циклы продолжают работать. После перезапуска
+    Home Assistant расписание восстанавливается по текущему времени, а отсчёт
+    задержки отсутствия начинается заново. Состояния проверяются раз в минуту.
+
+    При необходимости общее время включённого состояния розетки можно
+    накапливать в помощнике input_number.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+
+  input:
+    plug_entity:
+      name: "Умная розетка"
+      description: "Switch-сущность розетки, к которой подключён рециркулятор."
+      selector:
+        entity:
+          filter:
+            - domain: switch
+
+    presence_sensor:
+      name: "Датчик присутствия"
+      description: >-
+        Бинарный датчик, у которого состояние on означает присутствие,
+        а off — отсутствие. Можно выбрать группу бинарных датчиков.
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+
+    absence_delay:
+      name: "Работа после окончания присутствия"
+      description: >-
+        Через какое время непрерывного отсутствия разрешить выключение
+        рециркулятора. Активный запланированный цикл всё равно продолжится.
+      default:
+        hours: 0
+        minutes: 45
+        seconds: 0
+      selector:
+        duration: {}
+
+    cycle_interval:
+      name: "Интервал между включениями по расписанию"
+      description: >-
+        Время между началами запланированных циклов. При интервале 180 минут
+        и работе 30 минут рециркулятор отдыхает 150 минут до следующего цикла.
+      default: 180
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          unit_of_measurement: "мин"
+          mode: box
+
+    run_duration:
+      name: "Длительность работы по расписанию"
+      description: >-
+        Продолжительность каждого запланированного цикла. Значение должно быть
+        не больше интервала между включениями. Цикл обрывается при окончании
+        временного диапазона, если его не продлевает присутствие или задержка.
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          unit_of_measurement: "мин"
+          mode: box
+
+    schedule_start:
+      name: "Начало расписания"
+      description: "Время первого запланированного включения и начала циклов."
+      default: "08:00:00"
+      selector:
+        time: {}
+
+    schedule_end:
+      name: "Конец расписания"
+      description: >-
+        После этого времени новые циклы не работают. Если конец раньше
+        начала, период продолжается после полуночи. Одинаковые начало и конец
+        задают круглосуточное расписание. Управление по присутствию действует
+        и за пределами этих часов.
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    runtime_counter:
+      name: "Счётчик времени работы"
+      description: >-
+        Необязательный помощник input_number, в котором накапливается общее
+        время включённого состояния розетки в часах. Создайте помощник с
+        единицей измерения «ч», минимальным значением 0, достаточно большим
+        максимальным значением и шагом не больше 0,01. Точность подсчёта —
+        около одной минуты. Оставьте поле пустым, чтобы не вести подсчёт.
+      default: ""
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+
+# Запуски выполняются последовательно. Условия повторно вычисляются внутри
+# каждого запуска, чтобы ожидавшее в очереди событие не использовало старые
+# состояния присутствия или расписания.
+mode: queued
+max: 10
+
+variables:
+  plug: !input plug_entity
+  presence: !input presence_sensor
+  interval_minutes: !input cycle_interval
+  duration_minutes: !input run_duration
+  start_time: !input schedule_start
+  end_time: !input schedule_end
+  runtime_counter_entity: !input runtime_counter
+
+triggers:
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "on"
+    id: presence_detected
+
+  - trigger: state
+    entity_id: !input presence_sensor
+    to: "off"
+    for: !input absence_delay
+    id: absence_elapsed
+
+  - trigger: time_pattern
+    minutes: "/1"
+    id: periodic_check
+
+  - trigger: time
+    at: !input schedule_start
+    id: schedule_start
+
+  - trigger: time
+    at: !input schedule_end
+    id: schedule_end
+
+  - trigger: homeassistant
+    event: start
+    id: startup
+
+  # Ручное переключение и восстановление доступности розетки.
+  - trigger: state
+    entity_id: !input plug_entity
+    to: null
+    id: plug_changed
+
+conditions: []
+
+actions:
+  - variables:
+      cycle_active: >-
+        {% set current = now() %}
+        {% set start = today_at(start_time) %}
+        {% set end = today_at(end_time) %}
+        {% if start == end %}
+          {% if current < start %}
+            {% set start = start - timedelta(days=1) %}
+          {% endif %}
+          {% set end = start + timedelta(days=1) %}
+        {% elif start > end %}
+          {% if current < end %}
+            {% set start = start - timedelta(days=1) %}
+          {% else %}
+            {% set end = end + timedelta(days=1) %}
+          {% endif %}
+        {% endif %}
+        {% set interval = interval_minutes | float(0) %}
+        {% set duration = duration_minutes | float(0) %}
+        {% set elapsed = (as_timestamp(current) - as_timestamp(start)) / 60 %}
+        {{ 1 <= duration <= interval <= 1440 and start <= current < end
+           and elapsed % interval < duration }}
+
+  - if:
+      - condition: trigger
+        id: periodic_check
+      - condition: template
+        alias: "Выбран счётчик, розетка включена"
+        value_template: >-
+          {{ runtime_counter_entity | length > 0
+             and states(runtime_counter_entity) not in ['unknown', 'unavailable']
+             and is_state(plug, 'on') }}
+    then:
+      - action: input_number.set_value
+        alias: "Добавить одну минуту к времени работы"
+        target:
+          entity_id: "{{ runtime_counter_entity }}"
+        data:
+          value: >-
+            {% set current_hours = states(runtime_counter_entity) | float(0) %}
+            {% set maximum = state_attr(runtime_counter_entity, 'max') | float(1000000) %}
+            {{ [current_hours + 1 / 60, maximum] | min }}
+
+  - choose:
+      - conditions:
+          - condition: template
+            alias: "Есть присутствие или активен запланированный цикл"
+            value_template: >-
+              {{ cycle_active or is_state(presence, 'on') }}
+          - condition: template
+            value_template: "{{ is_state(plug, 'off') }}"
+        sequence:
+          - action: switch.turn_on
+            alias: "Включить рециркулятор"
+            continue_on_error: true
+            target:
+              entity_id: !input plug_entity
+
+      - conditions:
+          - condition: template
+            alias: "Запланированный цикл неактивен"
+            value_template: "{{ not cycle_active }}"
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
+            for: !input absence_delay
+          - condition: template
+            value_template: "{{ is_state(plug, 'on') }}"
+        sequence:
+          - action: switch.turn_off
+            alias: "Выключить после отсутствия и расписания"
+            continue_on_error: true
+            target:
+              entity_id: !input plug_entity

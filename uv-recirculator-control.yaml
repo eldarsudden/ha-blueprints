@@ -2,21 +2,22 @@ blueprint:
   name: "UV Recirculator Presence and Schedule Control"
   description: >-
     Управляет закрытым UV-рециркулятором через умную розетку по присутствию
-    и периодическому расписанию.
+    и расписанию непрерывной работы.
 
     При обнаружении присутствия розетка включается независимо от расписания.
     После окончания присутствия рециркулятор продолжает работать в течение
-    заданного времени и выключается, только если в этот момент не идёт
-    запланированный цикл. Повторное присутствие отменяет ожидаемое выключение.
+    заданного времени и выключается только вне диапазона непрерывной работы.
+    Повторное присутствие отменяет ожидаемое выключение.
 
-    Запланированные циклы работают независимо от присутствия: задайте интервал
-    между началами включений, длительность работы и временной диапазон. Циклы
-    отсчитываются от начала расписания каждый день. Ночной диапазон
-    может проходить через полночь. Одинаковые начало и конец разрешают
-    круглосуточное расписание.
+    В заданном временном диапазоне розетка включена постоянно независимо
+    от присутствия. По умолчанию это ночное время с 22:00 до 08:00.
+    Диапазон может проходить через полночь. Одинаковые начало и конец
+    разрешают круглосуточную работу. После окончания диапазона розетка
+    выключается, если присутствия нет и задержка после ухода уже истекла.
+    Задержка отсчитывается от окончания присутствия, а не от конца расписания.
 
     Недоступное или неизвестное состояние датчика присутствия не выключает
-    розетку, но запланированные циклы продолжают работать. После перезапуска
+    розетку, но включение по расписанию продолжает работать. После перезапуска
     Home Assistant расписание восстанавливается по текущему времени, а отсчёт
     задержки отсутствия начинается заново. Состояния проверяются раз в минуту.
 
@@ -49,7 +50,8 @@ blueprint:
       name: "Работа после окончания присутствия"
       description: >-
         Через какое время непрерывного отсутствия разрешить выключение
-        рециркулятора. Активный запланированный цикл всё равно продолжится.
+        рециркулятора. В пределах заданного временного диапазона
+        розетка остаётся включённой независимо от этой задержки.
       default:
         hours: 0
         minutes: 45
@@ -57,50 +59,21 @@ blueprint:
       selector:
         duration: {}
 
-    cycle_interval:
-      name: "Интервал между включениями по расписанию"
-      description: >-
-        Время между началами запланированных циклов. При интервале 180 минут
-        и работе 30 минут рециркулятор отдыхает 150 минут до следующего цикла.
-      default: 180
-      selector:
-        number:
-          min: 1
-          max: 1440
-          step: 1
-          unit_of_measurement: "мин"
-          mode: box
-
-    run_duration:
-      name: "Длительность работы по расписанию"
-      description: >-
-        Продолжительность каждого запланированного цикла. Значение должно быть
-        не больше интервала между включениями. Цикл обрывается при окончании
-        временного диапазона, если его не продлевает присутствие или задержка.
-      default: 30
-      selector:
-        number:
-          min: 1
-          max: 1440
-          step: 1
-          unit_of_measurement: "мин"
-          mode: box
-
     schedule_start:
-      name: "Начало расписания"
-      description: "Время первого запланированного включения и начала циклов."
-      default: "08:00:00"
+      name: "Начало непрерывной работы"
+      description: "С этого времени розетка постоянно включена независимо от присутствия."
+      default: "22:00:00"
       selector:
         time: {}
 
     schedule_end:
-      name: "Конец расписания"
+      name: "Конец непрерывной работы"
       description: >-
-        После этого времени новые циклы не работают. Если конец раньше
-        начала, период продолжается после полуночи. Одинаковые начало и конец
-        задают круглосуточное расписание. Управление по присутствию действует
-        и за пределами этих часов.
-      default: "22:00:00"
+        После этого времени розетка работает только по присутствию
+        и задержке после ухода. Если конец раньше начала, диапазон
+        продолжается после полуночи. Одинаковые начало и конец задают
+        круглосуточную работу.
+      default: "08:00:00"
       selector:
         time: {}
 
@@ -127,8 +100,6 @@ max: 10
 variables:
   plug: !input plug_entity
   presence: !input presence_sensor
-  interval_minutes: !input cycle_interval
-  duration_minutes: !input run_duration
   start_time: !input schedule_start
   end_time: !input schedule_end
   runtime_counter_entity: !input runtime_counter
@@ -171,27 +142,17 @@ conditions: []
 
 actions:
   - variables:
-      cycle_active: >-
+      schedule_active: >-
         {% set current = now() %}
         {% set start = today_at(start_time) %}
         {% set end = today_at(end_time) %}
         {% if start == end %}
-          {% if current < start %}
-            {% set start = start - timedelta(days=1) %}
-          {% endif %}
-          {% set end = start + timedelta(days=1) %}
-        {% elif start > end %}
-          {% if current < end %}
-            {% set start = start - timedelta(days=1) %}
-          {% else %}
-            {% set end = end + timedelta(days=1) %}
-          {% endif %}
+          {{ true }}
+        {% elif start < end %}
+          {{ start <= current < end }}
+        {% else %}
+          {{ current >= start or current < end }}
         {% endif %}
-        {% set interval = interval_minutes | float(0) %}
-        {% set duration = duration_minutes | float(0) %}
-        {% set elapsed = (as_timestamp(current) - as_timestamp(start)) / 60 %}
-        {{ 1 <= duration <= interval <= 1440 and start <= current < end
-           and elapsed % interval < duration }}
 
   - if:
       - condition: trigger
@@ -205,6 +166,8 @@ actions:
     then:
       - action: input_number.set_value
         alias: "Добавить одну минуту к времени работы"
+        # Ошибка необязательного счётчика не должна прерывать управление розеткой.
+        continue_on_error: true
         target:
           entity_id: "{{ runtime_counter_entity }}"
         data:
@@ -216,9 +179,9 @@ actions:
   - choose:
       - conditions:
           - condition: template
-            alias: "Есть присутствие или активен запланированный цикл"
+            alias: "Есть присутствие или идёт непрерывная работа по расписанию"
             value_template: >-
-              {{ cycle_active or is_state(presence, 'on') }}
+              {{ schedule_active or is_state(presence, 'on') }}
           - condition: template
             value_template: "{{ is_state(plug, 'off') }}"
         sequence:
@@ -230,8 +193,8 @@ actions:
 
       - conditions:
           - condition: template
-            alias: "Запланированный цикл неактивен"
-            value_template: "{{ not cycle_active }}"
+            alias: "Диапазон непрерывной работы закончился"
+            value_template: "{{ not schedule_active }}"
           - condition: state
             entity_id: !input presence_sensor
             state: "off"

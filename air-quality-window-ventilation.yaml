@@ -22,6 +22,9 @@ blueprint:
     После перезапуска Home Assistant или перезагрузки автоматизации
     открытые окна считаются ручными, задержка по температуре отсчитывается
     заново. Помощник таймера не нужен.
+    Показания проверяются при изменениях датчиков и раз в минуту.
+    Новый запуск появляется в Activity, только если есть открытые окна
+    или выполнены условия открытия по воздуху и температуре.
     Причины команд открытия и закрытия записываются в Activity выбранного окна.
     После каждой команды устройству выдерживается пауза 1 секунда.
   domain: automation
@@ -254,6 +257,80 @@ variables:
   sensor_opening_entity: !input sensor_opening_entity
   sensor_opening_percentage: !input sensor_opening_percentage
 
+  temperature_entities: &temperature_entities_template >-
+    {{ selected_temperature_sensors if selected_temperature_sensors | count > 0
+       else area_entities(selected_area)
+       | select('match', '^sensor[.]')
+       | select('is_state_attr', 'device_class', 'temperature') | list }}
+  readings: &readings_template >-
+    {% set ns = namespace(air_valid=true, temperature_valid=true, errors=[],
+                          high=false, recovered=true, high_sources=[],
+                          temperatures=[], tvoc_units=[]) %}
+    {% for entity in co2_entities + tvoc_entities %}
+      {% set value = states(entity) %}
+      {% set unit = state_attr(entity, 'unit_of_measurement') %}
+      {% if not is_number(value) or value | float < 0 %}
+        {% set ns.air_valid = false %}
+        {% set ns.errors = ns.errors
+           + [entity ~ ': состояние «' ~ value ~ '», ожидалось неотрицательное число'] %}
+      {% else %}
+        {% set value = value | float %}
+        {% if entity in co2_entities %}
+          {% if unit != 'ppm' %}
+            {% set ns.air_valid = false %}
+            {% set ns.errors = ns.errors
+               + [entity ~ ': единица «' ~ (unit or 'не задана') ~ '», ожидалась ppm'] %}
+          {% endif %}
+          {% set ns.high = ns.high or value >= co2_open | float %}
+          {% if value >= co2_open | float %}
+            {% set ns.high_sources = ns.high_sources
+               + ['CO₂ (' ~ entity ~ '): ' ~ value ~ ' ppm ≥ ' ~ co2_open ~ ' ppm'] %}
+          {% endif %}
+          {% set ns.recovered = ns.recovered and value <= co2_close | float %}
+        {% endif %}
+        {% if entity in tvoc_entities %}
+          {% set ns.tvoc_units = ns.tvoc_units + [unit] %}
+          {% set ns.high = ns.high or value >= tvoc_open | float %}
+          {% if value >= tvoc_open | float %}
+            {% set ns.high_sources = ns.high_sources
+               + ['TVOC (' ~ entity ~ '): ' ~ value ~ ' ≥ ' ~ tvoc_open ~ ' ' ~ (unit or '')] %}
+          {% endif %}
+          {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {% if ns.tvoc_units | unique | list | count > 1 %}
+      {% set ns.errors = ns.errors
+         + ['TVOC (' ~ (tvoc_entities | join(', ')) ~ '): разные единицы измерения — '
+            ~ (ns.tvoc_units | map('string') | unique | join(', '))] %}
+    {% endif %}
+    {% if temperature_entities | count == 0 %}
+      {% set ns.errors = ns.errors
+         + ['Датчики температуры не выбраны и не найдены в Area «' ~ selected_area ~ '»'] %}
+    {% endif %}
+    {% for entity in temperature_entities %}
+      {% set value = states(entity) %}
+      {% set unit = state_attr(entity, 'unit_of_measurement') %}
+      {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+        {% set ns.temperature_valid = false %}
+        {% set ns.errors = ns.errors
+           + [entity ~ ': состояние «' ~ value ~ '», единица «' ~ (unit or 'не задана')
+              ~ '», ожидалась числовая температура в °C, °F или K'] %}
+      {% else %}
+        {% set value = value | float %}
+        {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+           else value - 273.15 if unit == 'K' else value %}
+        {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
+      {% endif %}
+    {% endfor %}
+    {% set air_valid = ns.air_valid and co2_entities | count + tvoc_entities | count > 0
+                       and ns.tvoc_units | unique | list | count <= 1 %}
+    {% set temperature_valid = ns.temperature_valid and ns.temperatures | count > 0 %}
+    {{ dict(valid=air_valid and temperature_valid,
+            air_valid=air_valid, temperature_valid=temperature_valid,
+            errors=ns.errors, high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
+            temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
+
 conditions:
   - condition: template
     alias: "Выбраны датчики и заданы корректные пороги"
@@ -263,6 +340,17 @@ conditions:
          and (co2_entities | count == 0 or co2_open | float > co2_close | float)
          and (tvoc_entities | count == 0 or tvoc_open | float > tvoc_close | float)
          and reopening_temperature | float > minimum_temperature | float }}
+
+  # Отсекаем пустые запуски до действий: они не попадают в Activity.
+  # Открытые вручную окна тоже требуют сопровождения по температуре.
+  - condition: template
+    alias: "Есть открытые окна или выполнены условия открытия"
+    value_template: >-
+      {{ windows | select('is_state', 'open') | list | count > 0
+         or windows | select('is_state', 'opening') | list | count > 0
+         or (readings.valid and readings.high
+             and readings.temperature >= reopening_temperature | float
+             and windows | select('is_state', 'closed') | list | count > 0) }}
 
 actions:
   - variables:
@@ -274,81 +362,10 @@ actions:
           value_template: "{{ true }}"
       sequence:
         - variables:
-            temperature_entities: >-
-              {{ selected_temperature_sensors if selected_temperature_sensors | count > 0
-                 else area_entities(selected_area)
-                 | select('match', '^sensor[.]')
-                 | select('is_state_attr', 'device_class', 'temperature') | list }}
+            temperature_entities: *temperature_entities_template
             observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + windows) | unique | list }}"
             observed_states: "{{ observed_entities | map('states') | list }}"
-            readings: >-
-              {% set ns = namespace(air_valid=true, temperature_valid=true, errors=[],
-                                    high=false, recovered=true, high_sources=[],
-                                    temperatures=[], tvoc_units=[]) %}
-              {% for entity in co2_entities + tvoc_entities %}
-                {% set value = states(entity) %}
-                {% set unit = state_attr(entity, 'unit_of_measurement') %}
-                {% if not is_number(value) or value | float < 0 %}
-                  {% set ns.air_valid = false %}
-                  {% set ns.errors = ns.errors
-                     + [entity ~ ': состояние «' ~ value ~ '», ожидалось неотрицательное число'] %}
-                {% else %}
-                  {% set value = value | float %}
-                  {% if entity in co2_entities %}
-                    {% if unit != 'ppm' %}
-                      {% set ns.air_valid = false %}
-                      {% set ns.errors = ns.errors
-                         + [entity ~ ': единица «' ~ (unit or 'не задана') ~ '», ожидалась ppm'] %}
-                    {% endif %}
-                    {% set ns.high = ns.high or value >= co2_open | float %}
-                    {% if value >= co2_open | float %}
-                      {% set ns.high_sources = ns.high_sources
-                         + ['CO₂ (' ~ entity ~ '): ' ~ value ~ ' ppm ≥ ' ~ co2_open ~ ' ppm'] %}
-                    {% endif %}
-                    {% set ns.recovered = ns.recovered and value <= co2_close | float %}
-                  {% endif %}
-                  {% if entity in tvoc_entities %}
-                    {% set ns.tvoc_units = ns.tvoc_units + [unit] %}
-                    {% set ns.high = ns.high or value >= tvoc_open | float %}
-                    {% if value >= tvoc_open | float %}
-                      {% set ns.high_sources = ns.high_sources
-                         + ['TVOC (' ~ entity ~ '): ' ~ value ~ ' ≥ ' ~ tvoc_open ~ ' ' ~ (unit or '')] %}
-                    {% endif %}
-                    {% set ns.recovered = ns.recovered and value <= tvoc_close | float %}
-                  {% endif %}
-                {% endif %}
-              {% endfor %}
-              {% if ns.tvoc_units | unique | list | count > 1 %}
-                {% set ns.errors = ns.errors
-                   + ['TVOC (' ~ (tvoc_entities | join(', ')) ~ '): разные единицы измерения — '
-                      ~ (ns.tvoc_units | map('string') | unique | join(', '))] %}
-              {% endif %}
-              {% if temperature_entities | count == 0 %}
-                {% set ns.errors = ns.errors
-                   + ['Датчики температуры не выбраны и не найдены в Area «' ~ selected_area ~ '»'] %}
-              {% endif %}
-              {% for entity in temperature_entities %}
-                {% set value = states(entity) %}
-                {% set unit = state_attr(entity, 'unit_of_measurement') %}
-                {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
-                  {% set ns.temperature_valid = false %}
-                  {% set ns.errors = ns.errors
-                     + [entity ~ ': состояние «' ~ value ~ '», единица «' ~ (unit or 'не задана')
-                        ~ '», ожидалась числовая температура в °C, °F или K'] %}
-                {% else %}
-                  {% set value = value | float %}
-                  {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
-                     else value - 273.15 if unit == 'K' else value %}
-                  {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
-                {% endif %}
-              {% endfor %}
-              {% set air_valid = ns.air_valid and co2_entities | count + tvoc_entities | count > 0
-                                 and ns.tvoc_units | unique | list | count <= 1 %}
-              {% set temperature_valid = ns.temperature_valid and ns.temperatures | count > 0 %}
-              {{ dict(valid=air_valid and temperature_valid,
-                      air_valid=air_valid, temperature_valid=temperature_valid,
-                      errors=ns.errors, high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
-                      temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
+            readings: *readings_template
             open_windows: >-
               {{ windows | select('is_state', 'open') | list
                  + windows | select('is_state', 'opening') | list }}

@@ -27,7 +27,13 @@ blueprint:
     или выполнены условия открытия по воздуху и температуре.
     Причины команд открытия и закрытия записываются в Activity выбранного окна.
     После каждой команды устройству выдерживается пауза 1 секунда.
+    Необязательно: отдельный датчик температуры у окна (например O-Air)
+    уменьшает базовый Opening limit, заданный во входе blueprint:
+    100/75/50/25% базы для четырёх температурных диапазонов.
+    Значение устройства не используется как база. Комнатная температура
+    по-прежнему отдельно управляет защитой от переохлаждения комнаты.
   domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/air-quality-window-ventilation.yaml
   homeassistant:
     min_version: 2025.9.0
 
@@ -72,9 +78,14 @@ blueprint:
               filter:
                 - domain: number
         sensor_opening_percentage:
-          name: "Максимальное открытие по датчикам"
-          description: "Лимит в процентах для выбранной выше number-сущности."
-          default: 100
+          name: "Базовый Opening limit"
+          description: >-
+            База температурной кривой, задаваемая только здесь, в blueprint.
+            При базе 15% ступени составят 15/11/8/4% хода привода.
+            Текущее значение Opening limit на устройстве не считывается
+            для формирования базы или ступеней. Без наружного датчика
+            это обычный фиксированный лимит открытия.
+          default: 15
           selector:
             number:
               min: 1
@@ -82,6 +93,78 @@ blueprint:
               step: 1
               unit_of_measurement: "%"
               mode: slider
+
+    outdoor_section:
+      name: "Температура у окна · поправка Opening limit"
+      icon: mdi:thermometer-low
+      collapsed: true
+      input:
+        outdoor_temperature_sensors:
+          name: "Датчик температуры O-Air / у окна (опционально)"
+          description: >-
+            Приближённый ориентир наружной температуры; при нескольких
+            датчиках используется минимум. Не включайте их в комнатные
+            датчики: из автоматического поиска температуры комнаты они
+            исключаются. Для поправки выберите number-сущность Opening limit.
+            Без наружного датчика поправка отключена. При некорректных
+            показаниях используется самая осторожная ступень — 25% базы.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: sensor
+                  device_class: temperature
+        outdoor_warm_threshold:
+          name: "100% базы при температуре от"
+          default: 15
+          selector:
+            number:
+              min: -40
+              max: 40
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+        outdoor_cool_threshold:
+          name: "75% базы при температуре от"
+          default: 10
+          selector:
+            number:
+              min: -40
+              max: 40
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+        outdoor_cold_threshold:
+          name: "50% базы при температуре от; ниже — 25%"
+          default: 0
+          selector:
+            number:
+              min: -40
+              max: 40
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+        outdoor_hysteresis:
+          name: "Запас температуры для увеличения открытия"
+          default: 1
+          selector:
+            number:
+              min: 0
+              max: 5
+              step: 0.5
+              unit_of_measurement: "°C"
+        outdoor_warmup_seconds:
+          name: "Стабильное потепление перед увеличением открытия"
+          description: "Уменьшение лимита при похолодании применяется сразу; увеличение — после этой выдержки."
+          default: 120
+          selector:
+            number:
+              min: 0
+              max: 1800
+              step: 30
+              unit_of_measurement: s
+              mode: box
 
     co2_section:
       name: "CO₂"
@@ -233,6 +316,9 @@ triggers:
     entity_id: !input temperature_sensors
     to: null
   - trigger: state
+    entity_id: !input outdoor_temperature_sensors
+    to: null
+  - trigger: state
     entity_id: !input window_entities
     to: null
   - trigger: homeassistant
@@ -256,16 +342,23 @@ variables:
   cold_close_delay: !input temperature_close_delay
   sensor_opening_entity: !input sensor_opening_entity
   sensor_opening_percentage: !input sensor_opening_percentage
+  outdoor_temperature_entities: !input outdoor_temperature_sensors
+  outdoor_warm: !input outdoor_warm_threshold
+  outdoor_cool: !input outdoor_cool_threshold
+  outdoor_cold: !input outdoor_cold_threshold
+  outdoor_hysteresis: !input outdoor_hysteresis
+  outdoor_warmup_seconds: !input outdoor_warmup_seconds
+  outdoor_thresholds_valid: "{{ outdoor_warm | float > outdoor_cool | float > outdoor_cold | float }}"
 
   temperature_entities: &temperature_entities_template >-
-    {{ selected_temperature_sensors if selected_temperature_sensors | count > 0
-       else area_entities(selected_area)
-       | select('match', '^sensor[.]')
-       | select('is_state_attr', 'device_class', 'temperature') | list }}
+    {% set candidates = selected_temperature_sensors if selected_temperature_sensors | count > 0
+       else area_entities(selected_area) | select('match', '^sensor[.]')
+       | select('is_state_attr', 'device_class', 'temperature') | list %}
+    {{ candidates | reject('in', outdoor_temperature_entities) | list }}
   readings: &readings_template >-
     {% set ns = namespace(air_valid=true, temperature_valid=true, errors=[],
                           high=false, recovered=true, high_sources=[],
-                          temperatures=[], tvoc_units=[]) %}
+                          temperatures=[], tvoc_units=[], outdoor_values=[], outdoor_valid=true) %}
     {% for entity in co2_entities + tvoc_entities %}
       {% set value = states(entity) %}
       {% set unit = state_attr(entity, 'unit_of_measurement') %}
@@ -323,13 +416,29 @@ variables:
         {% set ns.temperatures = ns.temperatures + [celsius | round(3)] %}
       {% endif %}
     {% endfor %}
+    {% for entity in outdoor_temperature_entities %}
+      {% set value = states(entity) %}
+      {% set unit = state_attr(entity, 'unit_of_measurement') %}
+      {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
+        {% set ns.outdoor_valid = false %}
+        {% set ns.errors = ns.errors + [entity ~ ': некорректная температура у окна; лимит 25% базы'] %}
+      {% else %}
+        {% set value = value | float %}
+        {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
+           else value - 273.15 if unit == 'K' else value %}
+        {% set ns.outdoor_values = ns.outdoor_values + [celsius | round(3)] %}
+      {% endif %}
+    {% endfor %}
     {% set air_valid = ns.air_valid and co2_entities | count + tvoc_entities | count > 0
                        and ns.tvoc_units | unique | list | count <= 1 %}
     {% set temperature_valid = ns.temperature_valid and ns.temperatures | count > 0 %}
     {{ dict(valid=air_valid and temperature_valid,
             air_valid=air_valid, temperature_valid=temperature_valid,
             errors=ns.errors, high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
-            temperature=ns.temperatures | min if ns.temperatures | count > 0 else none) }}
+            temperature=ns.temperatures | min if ns.temperatures | count > 0 else none,
+            outdoor_enabled=outdoor_temperature_entities | count > 0,
+            outdoor_valid=ns.outdoor_valid and ns.outdoor_values | count > 0,
+            outdoor_temperature=ns.outdoor_values | min if ns.outdoor_values | count > 0 else none) }}
 
 conditions:
   - condition: template
@@ -350,12 +459,18 @@ conditions:
          or windows | select('is_state', 'opening') | list | count > 0
          or (readings.valid and readings.high
              and readings.temperature >= reopening_temperature | float
+             and (not readings.outdoor_enabled
+                  or (sensor_opening_entity | length > 0 and outdoor_thresholds_valid))
              and windows | select('is_state', 'closed') | list | count > 0) }}
 
 actions:
   - variables:
       cold_since: {}
       automatic_windows: []
+      outdoor_band: null
+      warming_since: null
+      warming_target: null
+      last_applied_opening_limit: null
   - repeat:
       while:
         - condition: template
@@ -363,9 +478,43 @@ actions:
       sequence:
         - variables:
             temperature_entities: *temperature_entities_template
-            observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + windows) | unique | list }}"
+            observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + outdoor_temperature_entities + windows) | unique | list }}"
             observed_states: "{{ observed_entities | map('states') | list }}"
             readings: *readings_template
+            nominal_outdoor_band: >-
+              {% if not readings.outdoor_enabled %}0
+              {% elif not readings.outdoor_valid or not outdoor_thresholds_valid %}3
+              {% elif readings.outdoor_temperature >= outdoor_warm | float %}0
+              {% elif readings.outdoor_temperature >= outdoor_cool | float %}1
+              {% elif readings.outdoor_temperature >= outdoor_cold | float %}2
+              {% else %}3{% endif %}
+            candidate_outdoor_band: >-
+              {% set nominal = nominal_outdoor_band | int %}
+              {% if outdoor_band is none or nominal >= outdoor_band | int %}
+                {{ nominal }}
+              {% else %}
+                {% set boundaries = [outdoor_warm | float, outdoor_cool | float, outdoor_cold | float] %}
+                {% set ns = namespace(band=outdoor_band | int) %}
+                {% for band in range(outdoor_band | int, nominal, -1) %}
+                  {% if ns.band == band and readings.outdoor_temperature >= boundaries[band - 1] + outdoor_hysteresis | float %}
+                    {% set ns.band = band - 1 %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.band }}
+              {% endif %}
+            warming_since: >-
+              {{ (warming_since if warming_since is not none and warming_target == candidate_outdoor_band | int
+                  else as_timestamp(now()))
+                 if outdoor_band is not none and candidate_outdoor_band | int < outdoor_band | int else none }}
+            outdoor_band: >-
+              {{ candidate_outdoor_band | int
+                 if outdoor_band is none or candidate_outdoor_band | int >= outdoor_band | int
+                    or (warming_since is not none and as_timestamp(now()) - warming_since >= outdoor_warmup_seconds | float)
+                 else outdoor_band | int }}
+            warming_target: "{{ candidate_outdoor_band | int if candidate_outdoor_band | int < outdoor_band | int else none }}"
+            effective_opening_limit: >-
+              {{ [1, (sensor_opening_percentage | float * [1, 0.75, 0.5, 0.25][outdoor_band | int]) | round(0) | int] | max
+                 if readings.outdoor_enabled else sensor_opening_percentage | float }}
             open_windows: >-
               {{ windows | select('is_state', 'open') | list
                  + windows | select('is_state', 'opening') | list }}
@@ -390,6 +539,41 @@ actions:
               {{ (cold_close_windows
                   + (automatic_windows if readings.air_valid and readings.recovered else []))
                  | unique | list }}
+
+        # Only windows opened by this run are adjusted. The base above comes
+        # exclusively from the blueprint input, never from a device reading.
+        - if:
+            - condition: template
+              value_template: >-
+                {{ readings.outdoor_enabled and sensor_opening_entity | length > 0
+                   and outdoor_thresholds_valid and automatic_windows | count > 0
+                   and close_windows | count == 0
+                   and effective_opening_limit != last_applied_opening_limit }}
+          then:
+            - action: number.set_value
+              target:
+                entity_id: "{{ sensor_opening_entity }}"
+              data:
+                value: "{{ effective_opening_limit }}"
+            - variables:
+                last_applied_opening_limit: "{{ effective_opening_limit }}"
+            - repeat:
+                for_each: "{{ automatic_windows }}"
+                sequence:
+                  - action: cover.open_cover
+                    target:
+                      entity_id: "{{ repeat.item }}"
+                  - action: logbook.log
+                    continue_on_error: true
+                    data:
+                      name: "Проветривание · Opening limit"
+                      entity_id: "{{ repeat.item }}"
+                      message: >-
+                        Лимит {{ effective_opening_limit }}% из базы blueprint
+                        {{ sensor_opening_percentage }}%; температура у окна
+                        {{ readings.outdoor_temperature if readings.outdoor_valid else 'недоступна' }} °C.
+                  - delay:
+                      seconds: 1
 
         - choose:
             - conditions:
@@ -431,6 +615,8 @@ actions:
                   alias: "Воздух требует проветривания и комната прогрета"
                   value_template: >-
                     {{ readings.valid and readings.high and readings.temperature >= reopening_temperature | float
+                       and (not readings.outdoor_enabled
+                            or (sensor_opening_entity | length > 0 and outdoor_thresholds_valid))
                        and windows | select('is_state', 'closed') | list | count > 0 }}
               sequence:
                 - variables:
@@ -444,7 +630,9 @@ actions:
                           target:
                             entity_id: "{{ sensor_opening_entity }}"
                           data:
-                            value: "{{ sensor_opening_percentage | float }}"
+                            value: "{{ effective_opening_limit }}"
+                        - variables:
+                            last_applied_opening_limit: "{{ effective_opening_limit }}"
                         - delay:
                             seconds: 1
                 - repeat:

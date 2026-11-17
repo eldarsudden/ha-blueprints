@@ -3,7 +3,11 @@ blueprint:
   description: >-
     Keep selected devices on while presence is detected and turn them off
     after the configured absence delay. A device switched off during presence
-    is turned back on automatically.
+    is turned back on automatically unless an optional manual-override timer
+    is active. With a timer selected, on/off commands made by a signed-in
+    Home Assistant user start a temporary override. The timer can also be
+    started or cancelled from a dashboard. Physical controls that do not
+    report a user context should use the dashboard timer explicitly.
 
     Select a binary sensor where on means presence and off means absence.
     Devices must support the Home Assistant turn_on and turn_off actions.
@@ -14,6 +18,7 @@ blueprint:
     once per minute. These checks recover from missed events and restarts;
     the absence delay starts again after a restart.
   domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/presence-device-control.yaml
   homeassistant:
     min_version: 2024.10.0
   input:
@@ -61,12 +66,35 @@ blueprint:
       selector:
         duration: {}
 
+    pause_timers:
+      name: "Таймер ручного приоритета (опционально)"
+      description: >-
+        Select a timer helper with Restore enabled. While any selected timer
+        is active, paused, unknown or unavailable, no device commands are
+        sent. When all timers return to idle, presence control resumes.
+        Leave empty to retain the original behavior.
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: timer
+          multiple: true
+
+    manual_pause_duration:
+      name: "Ручной приоритет после команды из Home Assistant"
+      description: "How long an on/off command from a signed-in user overrides presence control."
+      default:
+        minutes: 30
+      selector:
+        duration: {}
+
 # Последовательная обработка не прерывает команды остальным устройствам.
 mode: queued
 max: 25
 
 variables:
   controlled_entities: !input controlled_entities
+  pause_timers: !input pause_timers
 
 triggers:
   - trigger: state
@@ -90,10 +118,34 @@ triggers:
   - trigger: time_pattern
     minutes: "/1"
     id: periodic_check
+  - trigger: state
+    entity_id: !input pause_timers
+    to: null
+    id: pause_changed
 
 conditions: []
 
 actions:
+  # Handle the user command before attempting to reconcile device states.
+  - if:
+      - condition: trigger
+        id: device_changed
+      - condition: template
+        value_template: >-
+          {{ pause_timers | count > 0
+             and trigger.to_state is not none
+             and trigger.to_state.state in ['on', 'off']
+             and trigger.to_state.context.user_id is not none }}
+    then:
+      - action: timer.start
+        target:
+          entity_id: !input pause_timers
+        data:
+          duration: !input manual_pause_duration
+      - stop: "Manual command: presence control is temporarily paused"
+  # No timer input means no override; a configured missing timer fails closed.
+  - condition: template
+    value_template: "{{ pause_timers | reject('is_state', 'idle') | list | count == 0 }}"
   - choose:
       - conditions:
           - condition: state

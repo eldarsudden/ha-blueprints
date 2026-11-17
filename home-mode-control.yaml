@@ -1,0 +1,90 @@
+blueprint:
+  name: "Home Mode Control"
+  description: >-
+    Manual Home/Away/Sleep modes. Away turns off the selected lights and
+    pauses selected media players that are playing. Sleep pauses playback;
+    occupancy night lighting can follow the same mode helper separately.
+    Home leaves devices in their current state and lets normal automation
+    resume. This blueprint never changes locks, heating or vacuum cleaners.
+    The mode is also reconciled after Home Assistant starts.
+  domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/home-mode-control.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    mode_entity:
+      name: "Режим дома"
+      selector:
+        entity:
+          filter:
+            - domain: input_select
+    away_mode_value:
+      name: "Название режима отсутствия"
+      default: "Ушли"
+      selector:
+        text: {}
+    sleep_mode_value:
+      name: "Название режима сна"
+      default: "Сон"
+      selector:
+        text: {}
+    lights_target:
+      name: "Свет для выключения при уходе"
+      selector:
+        target:
+          entity:
+            domain: light
+    media_players:
+      name: "Музыка для приостановки"
+      description: "Only playing entities receive a pause command; idle, off and unavailable ones are skipped."
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: true
+
+mode: restart
+
+variables:
+  media_players: !input media_players
+
+triggers:
+  - trigger: state
+    entity_id: !input mode_entity
+    to: null
+  - trigger: homeassistant
+    event: start
+
+conditions: []
+
+actions:
+  - if:
+      - condition: state
+        entity_id: !input mode_entity
+        state: !input away_mode_value
+    then:
+      - action: light.turn_off
+        continue_on_error: true
+        target: !input lights_target
+  - if:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: !input mode_entity
+            state: !input away_mode_value
+          - condition: state
+            entity_id: !input mode_entity
+            state: !input sleep_mode_value
+    then:
+      - repeat:
+          for_each: "{{ media_players }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ is_state(repeat.item, 'playing') }}"
+              then:
+                - action: media_player.media_pause
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"

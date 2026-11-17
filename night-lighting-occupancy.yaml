@@ -2,6 +2,9 @@ blueprint:
   name: "Night Lighting by Occupancy (Full Customization)"
   description: "Включает свет / Yeelight Moonlight-mode / Ambilight в заданный интервал времени по датчику присутствия. С выбором типа ночного режима и настраиваемым временем автовыключения."
   domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/night-lighting-occupancy.yaml
+  homeassistant:
+    min_version: "2026.7.0"
   input:
     target_area:
       name: Area
@@ -35,9 +38,41 @@ blueprint:
     clear_delay:
       name: Off Delay
       description: "Время отсутствия присутствия перед выключением света"
-      default: 60
+      default:
+        seconds: 60
       selector:
         duration: {}
+
+    home_mode_entities:
+      name: "Режим дома (опционально)"
+      description: >-
+        Optional input_select helper. Sleep mode enables night lighting
+        regardless of the clock; Away mode suppresses automatic light
+        commands. Leave empty to use the existing time schedule only.
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: input_select
+          multiple: true
+    turn_off_main_in_ambilight:
+      name: "Выключать основной свет при Ambilight"
+      description: >-
+        Preserve the preferred normal-time behavior. Sleep mode always
+        turns the main lights off when enabling Ambilight night lighting.
+      default: true
+      selector:
+        boolean: {}
+    sleep_mode_value:
+      name: "Название режима сна"
+      default: "Сон"
+      selector:
+        text: {}
+    away_mode_value:
+      name: "Название режима отсутствия"
+      default: "Ушли"
+      selector:
+        text: {}
 
 mode: restart
 
@@ -53,12 +88,26 @@ triggers:
     options:
       behavior: each
       for: !input clear_delay
+  - trigger: state
+    entity_id: !input home_mode_entities
+    to: null
+    id: home_mode_changed
+  - trigger: homeassistant
+    event: start
+    id: startup
 
-conditions: []
+conditions:
+  - condition: template
+    value_template: >-
+      {{ home_mode_entities | select('is_state', away_mode_value) | list | count == 0 }}
 
 variables:
   target_area: !input target_area
   night_mode_type: !input night_mode_type
+  home_mode_entities: !input home_mode_entities
+  sleep_mode_value: !input sleep_mode_value
+  away_mode_value: !input away_mode_value
+  turn_off_main_in_ambilight: !input turn_off_main_in_ambilight
   ambilight_entities: >-
     {{ area_entities(target_area) | select('match', '.*_ambilight$') | list }}
   main_entities: >-
@@ -70,9 +119,14 @@ variables:
 actions:
   - choose:
       - conditions:
-          - condition: time
-            after: !input night_start
-            before: !input night_end
+          - condition: or
+            conditions:
+              - condition: time
+                after: !input night_start
+                before: !input night_end
+              - condition: template
+                value_template: >-
+                  {{ home_mode_entities | select('is_state', sleep_mode_value) | list | count > 0 }}
           - condition: occupancy.is_detected
             target:
               area_id: !input target_area
@@ -103,10 +157,16 @@ actions:
                   - condition: template
                     value_template: "{{ night_mode_type == 'ambilight' }}"
                 sequence:
-                  - action: light.turn_off
-                    target:
-                      entity_id: "{{ main_entities }}"
-                    data: {}
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ turn_off_main_in_ambilight
+                             or home_mode_entities | select('is_state', sleep_mode_value) | list | count > 0 }}
+                    then:
+                      - action: light.turn_off
+                        target:
+                          entity_id: "{{ main_entities }}"
+                        data: {}
                   - action: light.turn_on
                     target:
                       entity_id: "{{ ambilight_entities }}"

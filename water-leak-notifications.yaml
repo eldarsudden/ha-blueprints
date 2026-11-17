@@ -1,0 +1,171 @@
+blueprint:
+  name: "Water Leak Notifications with Acknowledgment"
+  description: >-
+    Repeated mobile notifications with room names and a unique acknowledgment
+    action. An unacknowledged alert survives Home Assistant restarts through
+    helpers. A new leak replaces the current notification and acknowledgment
+    token. This blueprint only sends notifications: water shutoff belongs in
+    a separate automation so acknowledgment can never cancel a valve command.
+    Notification actions can reference alarm_message, ack_action and
+    notification_tag. Clear actions can reference notification_tag.
+  domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/water-leak-notifications.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    moisture_sensors:
+      name: "Датчики протечки"
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+              device_class: moisture
+          multiple: true
+    active_alert:
+      name: "Неподтверждённая протечка"
+      description: "An input_boolean without a forced initial value, so its state is restored. Turning it off acknowledges the alert."
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+    acknowledgment_token:
+      name: "Контекст подтверждения"
+      description: "An input_text helper with maximum length at least 100; leave its initial value unset."
+      selector:
+        entity:
+          filter:
+            - domain: input_text
+    rooms_memory:
+      name: "Помещение последней протечки"
+      description: "An input_text helper with maximum length at least 200; leave its initial value unset."
+      selector:
+        entity:
+          filter:
+            - domain: input_text
+    notification_actions:
+      name: "Отправить уведомления"
+      description: "Use alarm_message as the message, ack_action for the acknowledgment button, and notification_tag to replace earlier notifications."
+      selector:
+        action: {}
+    clear_actions:
+      name: "Очистить уведомления после подтверждения"
+      default: []
+      selector:
+        action: {}
+    repeat_interval:
+      name: "Повторять до подтверждения каждые"
+      default:
+        minutes: 5
+      selector:
+        duration: {}
+
+mode: restart
+
+variables:
+  moisture_sensors: !input moisture_sensors
+  active_alert: !input active_alert
+  acknowledgment_token: !input acknowledgment_token
+  rooms_memory: !input rooms_memory
+  notification_tag: "water_leak_{{ this.entity_id.split('.')[1] }}"
+  wet_sensors: "{{ moisture_sensors | select('is_state', 'on') | list }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input moisture_sensors
+    to: "on"
+    id: wet
+  - trigger: homeassistant
+    event: start
+    id: startup
+  - trigger: event
+    event_type: mobile_app_notification_action
+    id: acknowledgment
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: acknowledgment
+          - condition: template
+            value_template: >-
+              {{ states(acknowledgment_token).startswith('LEAK_ACK_')
+                 and trigger.event.data.get('action', '') == states(acknowledgment_token) }}
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: [wet, startup]
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: !input active_alert
+                state: "on"
+              - condition: template
+                value_template: "{{ wet_sensors | count > 0 }}"
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: acknowledgment
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: !input active_alert
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: "{{ notification_tag }}"
+          - choose: []
+            default: !input clear_actions
+          - stop: "Leak alert acknowledged"
+  - variables:
+      ack_action: "{{ 'LEAK_ACK_' ~ context.id }}"
+      affected_rooms: >-
+        {% set ns = namespace(names=[]) %}
+        {% for entity in wet_sensors %}
+          {% set room = area_name(entity) or state_attr(entity, 'friendly_name') or entity %}
+          {% if room not in ns.names %}{% set ns.names = ns.names + [room] %}{% endif %}
+        {% endfor %}
+        {{ (ns.names | join(', ') if ns.names else
+            (states(rooms_memory) if states(rooms_memory) not in ['', 'unknown', 'unavailable']
+             else 'Помещение не определено')) | truncate(180, true, '…') }}
+  - action: input_text.set_value
+    target:
+      entity_id: !input acknowledgment_token
+    data:
+      value: "{{ ack_action }}"
+  - action: input_text.set_value
+    target:
+      entity_id: !input rooms_memory
+    data:
+      value: "{{ affected_rooms }}"
+  - action: input_boolean.turn_on
+    target:
+      entity_id: !input active_alert
+  - repeat:
+      while:
+        - condition: state
+          entity_id: !input active_alert
+          state: "on"
+      sequence:
+        - variables:
+            alarm_message: >-
+              Сигнал протечки: {{ states(rooms_memory) }}.
+              Проверьте помещение и состояние кранов.
+              Нажмите «Подтверждаю», чтобы остановить повторные уведомления.
+        - action: persistent_notification.create
+          data:
+            notification_id: "{{ notification_tag }}"
+            title: "Протечка воды"
+            message: "{{ alarm_message }}"
+        - choose: []
+          default: !input notification_actions
+        - wait_template: "{{ is_state(active_alert, 'off') }}"
+          timeout: !input repeat_interval
+          continue_on_timeout: true
+  - action: persistent_notification.dismiss
+    data:
+      notification_id: "{{ notification_tag }}"
+  - choose: []
+    default: !input clear_actions

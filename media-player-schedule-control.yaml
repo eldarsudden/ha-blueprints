@@ -9,16 +9,29 @@ blueprint:
     Ручное изменение за допустимый предел исправляется автоматически.
     Вне интервала можно поддерживать другой заданный уровень; по умолчанию
     громкость остаётся как есть. Предыдущее значение не сохраняется.
-    Выключенные устройства не включаются, отключённый звук не снимается.
+    Обычное управление громкостью не затрагивает выключенные устройства
+    и не снимает отключение звука.
 
     Запрет воспроизведения останавливает уже играющее устройство и новые
     попытки запуска в состояниях playing и buffering. В режиме «Авто»
     используется поддерживаемая команда: остановка, иначе пауза, иначе
-    выключение. Можно выбрать команду вручную. Во время запрета управление
+    выключение. Можно выбрать команду вручную. Во время запрета обычное управление
     громкостью пропускается. По окончании запрета воспроизведение само
     не возобновляется. Реакция зависит от обновлений интеграции: начало
     звука может быть слышно до получения состояния. Это не блокировка
     команд на самом устройстве. Без поддерживаемой команды запрет не работает.
+
+    Для колонок с некорректным статусом есть способ «Громкость 0% + остановка».
+    Он поддерживает нулевую громкость независимо от статуса воспроизведения,
+    включая off и unknown, и работает даже при выключенном обычном управлении
+    громкостью. При ненулевом или неизвестном уровне сначала задаёт 0%, затем
+    отправляет поддерживаемую команду остановки, паузы или выключения.
+    Попытка повысить громкость запускает эти команды повторно. Если уровень
+    уже равен нулю, повторных команд нет. Недоступные устройства пропускаются.
+    Требуется поддержка volume_set; без команды остановки остаётся только
+    снижение громкости. Предыдущая громкость не сохраняется и не восстанавливается.
+    После запрета обычное расписание громкости может снова сделать звук слышимым,
+    если воспроизведение продолжилось без звука.
 
     Для Sonos выберите media_player каждой нужной колонки и, при наличии,
     switch-функции Night Sound. Эти переключатели включаются в своём
@@ -43,6 +56,7 @@ blueprint:
       description: >-
         Одно или несколько media_player, включая Sonos. Для управления
         громкостью нужны поддержка volume_set и атрибут volume_level.
+        Способ запрета «Громкость 0% + остановка» допускает неизвестный уровень.
         Для разных комнат и расписаний создайте несколько автоматизаций.
       selector:
         entity:
@@ -141,6 +155,10 @@ blueprint:
         Авто выбирает первую поддерживаемую команду. Явно выбранная команда
         выполняется только при наличии её поддержки у устройства.
         Для Sonos можно выбрать паузу, чтобы сохранить позицию воспроизведения.
+        «Громкость 0% + остановка» не зависит от статуса воспроизведения:
+        при каждой попытке поднять громкость возвращает 0% и повторно
+        останавливает устройство поддерживаемой командой, как в режиме Авто.
+        Если громкость уже нулевая, ничего не отправляет.
       default: auto
       selector:
         select:
@@ -153,6 +171,8 @@ blueprint:
               value: media_pause
             - label: "Выключение"
               value: turn_off
+            - label: "Громкость 0% + остановка (без проверки статуса)"
+              value: volume_zero
 
     sonos_night_switches:
       name: "Sonos: переключатели Night Sound"
@@ -264,20 +284,42 @@ actions:
                 - condition: template
                   value_template: "{{ playback_block_active }}"
               sequence:
+                - variables:
+                    zero_volume_required: >-
+                      {{ playback_block_action == 'volume_zero'
+                         and states(repeat.item) != 'unavailable'
+                         and (state_attr(repeat.item, 'supported_features') | int(0)
+                              | bitwise_and(4)) != 0
+                         and (not is_number(state_attr(repeat.item, 'volume_level'))
+                              or state_attr(repeat.item, 'volume_level') | float(0) != 0) }}
                 - if:
                     - condition: template
-                      value_template: "{{ states(repeat.item) in ['playing', 'buffering'] }}"
+                      value_template: "{{ zero_volume_required }}"
+                  then:
+                    - action: media_player.volume_set
+                      alias: "Обнулить громкость независимо от статуса воспроизведения"
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                      data:
+                        volume_level: 0
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {{ zero_volume_required
+                           or (playback_block_action != 'volume_zero'
+                               and states(repeat.item) in ['playing', 'buffering']) }}
                   then:
                     - variables:
                         stop_action: >-
                           {% set features = state_attr(repeat.item, 'supported_features') | int(0) %}
-                          {% if playback_block_action in ['auto', 'media_stop']
+                          {% if playback_block_action in ['auto', 'volume_zero', 'media_stop']
                                 and features | bitwise_and(4096) %}
                             media_player.media_stop
-                          {% elif playback_block_action in ['auto', 'media_pause']
+                          {% elif playback_block_action in ['auto', 'volume_zero', 'media_pause']
                                   and features | bitwise_and(1) %}
                             media_player.media_pause
-                          {% elif playback_block_action in ['auto', 'turn_off']
+                          {% elif playback_block_action in ['auto', 'volume_zero', 'turn_off']
                                   and features | bitwise_and(256) %}
                             media_player.turn_off
                           {% else %}

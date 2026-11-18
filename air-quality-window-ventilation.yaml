@@ -4,7 +4,17 @@ blueprint:
     По CO₂/TVOC: открывает закрытые окна при превышении порога любого
     датчика, если температура позволяет проветривание. При снижении всех
     показателей до порогов закрытия закрывает только окна, открытые этой
-    автоматизацией. На уже открытые вручную окна показания CO₂/TVOC не влияют.
+    автоматизацией, если не действует режим тёплой погоды.
+    На уже открытые вручную окна показания CO₂/TVOC не влияют.
+
+    Опционально: непрерывное проветривание в тёплую погоду. Если все выбранные
+    уличные датчики показывают температуру не ниже заданного порога, открывает
+    окна даже при нормальных CO₂/TVOC и не закрывает их после очистки воздуха.
+    Открытие по-прежнему требует прогретой комнаты, а защита от её охлаждения
+    продолжает работать. При похолодании на улице возвращается обычное
+    управление по CO₂/TVOC; автоматически открытые окна закрываются, если
+    воздух уже нормализовался. Без корректных показаний всех уличных датчиков
+    действует обычный режим. Ручные окна по воздуху не закрываются.
 
     По температуре: если температура остаётся ниже заданного порога,
     закрывает окна после указанной задержки, включая открытые вручную.
@@ -14,8 +24,9 @@ blueprint:
 
     Окна, открытые вручную, закрываются по температуре с указанной задержкой.
     Нормальные CO₂/TVOC не закрывают их и не отменяют температурный таймер.
-    Недоступные или некорректные показания блокируют новое открытие,
-    но сами по себе не закрывают окно. Закрытие по CO₂/TVOC требует
+    Недоступные или некорректные показания блокируют открытие по CO₂/TVOC,
+    но сами по себе не закрывают окно. В тёплом режиме показания CO₂/TVOC
+    не требуются для открытия. Закрытие по CO₂/TVOC требует
     корректных показаний всех датчиков воздуха; температурный таймер
     зависит только от датчиков температуры. При потере температуры
     отсчёт сбрасывается и начинается заново после восстановления показаний.
@@ -24,7 +35,7 @@ blueprint:
     заново. Помощник таймера не нужен.
     Показания проверяются при изменениях датчиков и раз в минуту.
     Новый запуск появляется в Activity, только если есть открытые окна
-    или выполнены условия открытия по воздуху и температуре.
+    или выполнены условия открытия по воздуху / тёплой погоде и температуре комнаты.
     Причины команд открытия и закрытия записываются в Activity выбранного окна.
     После каждой команды устройству выдерживается пауза 1 секунда.
     Необязательно: отдельный датчик температуры у окна (например O-Air)
@@ -106,6 +117,15 @@ blueprint:
       icon: mdi:thermometer-low
       collapsed: true
       input:
+        apply_outdoor_opening_limit:
+          name: "Уменьшать Opening limit при похолодании"
+          description: >-
+            Для температурной поправки выберите number-сущность Opening limit.
+            Выключите поправку, если уличные датчики нужны только для непрерывного
+            проветривания. Тогда сохраняется обычный базовый лимит, если он настроен.
+          default: true
+          selector:
+            boolean: {}
         outdoor_temperature_sensors:
           name: "Датчик температуры O-Air / у окна (опционально)"
           description: >-
@@ -258,6 +278,36 @@ blueprint:
               step: 1.0
               mode: box
 
+    warm_weather_section:
+      name: "Непрерывное проветривание в тёплую погоду"
+      icon: mdi:weather-sunny
+      collapsed: true
+      input:
+        keep_open_in_warm_weather:
+          name: "Оставлять окна открытыми в тёплую погоду"
+          description: >-
+            Открывать окна даже при нормальных CO₂/TVOC и держать их открытыми,
+            пока на улице тепло. Открытие разрешено только после прогрева
+            комнаты до порога открытия. Закрытие по холоду в комнате сохраняется.
+            Используются датчики из раздела температуры у окна. При нескольких
+            датчиках учитывается минимум. Нужны корректные показания каждого.
+          default: false
+          selector:
+            boolean: {}
+        warm_outdoor_threshold:
+          name: "Уличная температура для непрерывного проветривания"
+          description: >-
+            При температуре не ниже порога окна остаются открытыми независимо
+            от CO₂/TVOC. Ниже порога возвращается обычный режим проветривания.
+          default: 21
+          selector:
+            number:
+              min: -20
+              max: 40
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: box
+
     temperature_section:
       name: "Температура комнаты"
       icon: mdi:home-thermometer
@@ -362,6 +412,9 @@ variables:
   sensor_opening_entity: !input sensor_opening_entity
   sensor_opening_percentage: !input sensor_opening_percentage
   outdoor_temperature_entities: !input outdoor_temperature_sensors
+  apply_outdoor_opening_limit: !input apply_outdoor_opening_limit
+  keep_open_in_warm_weather: !input keep_open_in_warm_weather
+  warm_outdoor_threshold: !input warm_outdoor_threshold
   outdoor_warm: !input outdoor_warm_threshold
   outdoor_cool: !input outdoor_cool_threshold
   outdoor_cold: !input outdoor_cold_threshold
@@ -440,7 +493,7 @@ variables:
       {% set unit = state_attr(entity, 'unit_of_measurement') %}
       {% if not is_number(value) or unit not in ['°C', '°F', 'K'] %}
         {% set ns.outdoor_valid = false %}
-        {% set ns.errors = ns.errors + [entity ~ ': некорректная температура у окна; лимит 25% базы'] %}
+        {% set ns.errors = ns.errors + [entity ~ ': некорректная температура у окна; показания недоступны для уличных режимов'] %}
       {% else %}
         {% set value = value | float %}
         {% set celsius = (value - 32) * 5 / 9 if unit == '°F'
@@ -455,9 +508,13 @@ variables:
             air_valid=air_valid, temperature_valid=temperature_valid,
             errors=ns.errors, high=ns.high, high_sources=ns.high_sources, recovered=ns.recovered,
             temperature=ns.temperatures | min if ns.temperatures | count > 0 else none,
-            outdoor_enabled=outdoor_temperature_entities | count > 0,
+            outdoor_enabled=apply_outdoor_opening_limit and outdoor_temperature_entities | count > 0,
             outdoor_valid=ns.outdoor_valid and ns.outdoor_values | count > 0,
             outdoor_temperature=ns.outdoor_values | min if ns.outdoor_values | count > 0 else none) }}
+
+  warm_weather_active: &warm_weather_active_template >-
+    {{ keep_open_in_warm_weather and readings.outdoor_valid
+       and readings.outdoor_temperature >= warm_outdoor_threshold | float }}
 
 conditions:
   - condition: template
@@ -476,7 +533,8 @@ conditions:
     value_template: >-
       {{ windows | select('is_state', 'open') | list | count > 0
          or windows | select('is_state', 'opening') | list | count > 0
-         or (readings.valid and readings.high
+         or (readings.temperature_valid
+             and (warm_weather_active or (readings.air_valid and readings.high))
              and readings.temperature >= reopening_temperature | float
              and (not readings.outdoor_enabled
                   or (sensor_opening_entity | length > 0 and outdoor_thresholds_valid))
@@ -500,6 +558,7 @@ actions:
             observed_entities: "{{ (co2_entities + tvoc_entities + temperature_entities + outdoor_temperature_entities + windows) | unique | list }}"
             observed_states: "{{ observed_entities | map('states') | list }}"
             readings: *readings_template
+            warm_weather_active: *warm_weather_active_template
             nominal_outdoor_band: >-
               {% if not readings.outdoor_enabled %}0
               {% elif not readings.outdoor_valid or not outdoor_thresholds_valid %}3
@@ -556,7 +615,7 @@ actions:
               {{ ns.windows }}
             close_windows: >-
               {{ (cold_close_windows
-                  + (automatic_windows if readings.air_valid and readings.recovered else []))
+                  + (automatic_windows if readings.air_valid and readings.recovered and not warm_weather_active else []))
                  | unique | list }}
 
         # Only windows opened by this run are adjusted. The base above comes
@@ -631,9 +690,11 @@ actions:
 
             - conditions:
                 - condition: template
-                  alias: "Воздух требует проветривания и комната прогрета"
+                  alias: "Комната прогрета, воздух требует проветривания или на улице тепло"
                   value_template: >-
-                    {{ readings.valid and readings.high and readings.temperature >= reopening_temperature | float
+                    {{ readings.temperature_valid
+                       and (warm_weather_active or (readings.air_valid and readings.high))
+                       and readings.temperature >= reopening_temperature | float
                        and (not readings.outdoor_enabled
                             or (sensor_opening_entity | length > 0 and outdoor_thresholds_valid))
                        and windows | select('is_state', 'closed') | list | count > 0 }}
@@ -664,7 +725,13 @@ actions:
                           entity_id: "{{ repeat.item }}"
                           domain: cover
                           message: >-
-                            Команда открытия: {{ readings.high_sources | join('; ') }}.
+                            Команда открытия:
+                            {% if warm_weather_active %}
+                              непрерывное проветривание — уличная температура
+                              {{ readings.outdoor_temperature }} °C ≥ {{ warm_outdoor_threshold }} °C.
+                            {% else %}
+                              {{ readings.high_sources | join('; ') }}.
+                            {% endif %}
                             Температура {{ readings.temperature }} °C ≥ {{ reopening_temperature }} °C.
                       - variables:
                           automatic_windows: "{{ (automatic_windows + [repeat.item]) | unique | list }}"

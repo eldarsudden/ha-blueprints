@@ -102,7 +102,7 @@ class OpeningLimitCurve(unittest.TestCase):
         variables["close_windows"] = ["cover.automatic"]
         self.assertFalse(env.from_string(condition).render(**variables))
 
-    def readings(self, outdoor_state, outdoor_unit):
+    def readings(self, outdoor_state, outdoor_unit, apply_limit=True):
         states = {"sensor.room": "23", "sensor.co2": "1500", "sensor.outdoor": outdoor_state}
         units = {"sensor.room": "°C", "sensor.co2": "ppm", "sensor.outdoor": outdoor_unit}
         env = NativeEnvironment(undefined=StrictUndefined)
@@ -110,9 +110,45 @@ class OpeningLimitCurve(unittest.TestCase):
                            is_number=lambda value: value not in ["unknown", "unavailable"])
         result = env.from_string(self.bp["variables"]["readings"]).render(
             co2_entities=["sensor.co2"], tvoc_entities=[], temperature_entities=["sensor.room"],
-            outdoor_temperature_entities=["sensor.outdoor"], selected_area="room", co2_open=1000, co2_close=800,
+            outdoor_temperature_entities=["sensor.outdoor"], apply_outdoor_opening_limit=apply_limit, selected_area="room", co2_open=1000, co2_close=800,
             tvoc_open=500, tvoc_close=250)
         return ast.literal_eval(result.strip()) if isinstance(result, str) else result
+
+    def test_warm_weather_independent_of_opening_limit(self):
+        env = NativeEnvironment(undefined=StrictUndefined)
+        active = env.from_string(self.bp["variables"]["warm_weather_active"])
+        for outside, enabled, expected in [("21", True, True), ("20.9", True, False),
+                                           ("23", False, False), ("unavailable", True, False)]:
+            with self.subTest(outside=outside, enabled=enabled):
+                readings = self.readings(outside, "°C", apply_limit=False)
+                self.assertFalse(readings["outdoor_enabled"])
+                self.assertEqual(active.render(readings=readings, keep_open_in_warm_weather=enabled,
+                                               warm_outdoor_threshold=21), expected)
+
+    def test_warm_opening_still_requires_room_heat_and_configured_limit(self):
+        env = NativeEnvironment(undefined=StrictUndefined)
+        env.tests["is_state"] = lambda entity, state: state == "closed"
+        sequence = self.bp["actions"][1]["repeat"]["sequence"]
+        choose = next(action["choose"] for action in sequence if "choose" in action)
+        conditions = [self.bp["conditions"][1], choose[1]["conditions"][0]]
+        for condition in conditions:
+            template = env.from_string(condition["value_template"])
+            for room, curve, number, expected in [(23, False, "", True), (18, False, "", False),
+                                                   (23, True, "", False), (23, True, "number.limit", True)]:
+                with self.subTest(condition=condition["alias"], room=room, curve=curve, number=number):
+                    readings = dict(air_valid=False, high=False, temperature_valid=True, temperature=room,
+                                    outdoor_enabled=curve)
+                    self.assertEqual(template.render(readings=readings, warm_weather_active=True,
+                                                     reopening_temperature=21, windows=["cover.test"],
+                                                     sensor_opening_entity=number, outdoor_thresholds_valid=True), expected)
+
+    def test_warm_weather_suppresses_air_closure_but_keeps_cold_protection(self):
+        env = NativeEnvironment(undefined=StrictUndefined)
+        template = env.from_string(self.loop["close_windows"])
+        for warm, expected in [(True, ["cover.cold"]), (False, ["cover.cold", "cover.auto"])]:
+            self.assertEqual(template.render(readings=dict(air_valid=True, recovered=True),
+                                             automatic_windows=["cover.auto"], cold_close_windows=["cover.cold"],
+                                             warm_weather_active=warm), expected)
 
     def test_unconfigured_optional_number_still_compiles(self):
         target = self.bp["actions"][1]["repeat"]["sequence"][1]["then"][0]["target"]["entity_id"]
@@ -135,8 +171,8 @@ class OpeningLimitCurve(unittest.TestCase):
 
     def test_missing_opening_actuator_blocks_new_opening_but_not_manual_window_protection(self):
         env = NativeEnvironment(undefined=StrictUndefined)
-        variables = dict(windows=["cover.window"], readings=SimpleNamespace(valid=True, high=True, temperature=23, outdoor_enabled=True),
-                         reopening_temperature=22, sensor_opening_entity="", outdoor_thresholds_valid=True)
+        variables = dict(windows=["cover.window"], readings=SimpleNamespace(air_valid=True, temperature_valid=True, high=True, temperature=23, outdoor_enabled=True),
+                         reopening_temperature=22, sensor_opening_entity="", outdoor_thresholds_valid=True, warm_weather_active=False)
         template = self.bp["conditions"][1]["value_template"]
         env.tests["is_state"] = lambda entity, state: state == "closed"
         self.assertFalse(env.from_string(template).render(**variables))

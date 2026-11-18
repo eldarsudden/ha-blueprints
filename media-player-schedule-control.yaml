@@ -1,0 +1,346 @@
+blueprint:
+  name: "Media Player Schedule and Sonos Night Control"
+  description: >-
+    Управляет громкостью, запретом воспроизведения и ночным режимом Sonos
+    по трём независимым ежедневным расписаниям.
+
+    В интервале громкости можно понижать её до заданного максимума,
+    повышать до заданного минимума или поддерживать точный уровень.
+    Ручное изменение за допустимый предел исправляется автоматически.
+    Вне интервала можно поддерживать другой заданный уровень; по умолчанию
+    громкость остаётся как есть. Предыдущее значение не сохраняется.
+    Выключенные устройства не включаются, отключённый звук не снимается.
+
+    Запрет воспроизведения останавливает уже играющее устройство и новые
+    попытки запуска в состояниях playing и buffering. В режиме «Авто»
+    используется поддерживаемая команда: остановка, иначе пауза, иначе
+    выключение. Можно выбрать команду вручную. Во время запрета управление
+    громкостью пропускается. По окончании запрета воспроизведение само
+    не возобновляется. Реакция зависит от обновлений интеграции: начало
+    звука может быть слышно до получения состояния. Это не блокировка
+    команд на самом устройстве. Без поддерживаемой команды запрет не работает.
+
+    Для Sonos выберите media_player каждой нужной колонки и, при наличии,
+    switch-функции Night Sound. Эти переключатели включаются в своём
+    интервале и выключаются вне его. Night Sound доступен на совместимых
+    устройствах домашнего кинотеатра. Переключатели выбираются явно:
+    их имена не вычисляются из имени колонки. Остановка участника группы
+    Sonos может остановить всю группу; группы автоматически не разделяются.
+
+    Начало каждого интервала включительно, конец — исключительно.
+    Интервалы поддерживают переход через полночь; одинаковые начало
+    и конец означают круглосуточное действие. Используется местное время
+    Home Assistant. Состояния проверяются при изменениях, при запуске
+    Home Assistant и каждую минуту. Недоступные устройства пропускаются.
+  domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/media-player-schedule-control.yaml
+  homeassistant:
+    min_version: 2024.10.0
+
+  input:
+    media_players:
+      name: "Устройства воспроизведения"
+      description: >-
+        Одно или несколько media_player, включая Sonos. Для управления
+        громкостью нужны поддержка volume_set и атрибут volume_level.
+        Для разных комнат и расписаний создайте несколько автоматизаций.
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: true
+
+    volume_enabled:
+      name: "Управлять громкостью"
+      default: true
+      selector:
+        boolean: {}
+
+    volume_start:
+      name: "Начало интервала громкости"
+      default: "21:00:00"
+      selector:
+        time: {}
+
+    volume_end:
+      name: "Конец интервала громкости"
+      default: "08:00:00"
+      selector:
+        time: {}
+
+    volume_mode:
+      name: "Режим изменения громкости"
+      description: >-
+        Максимум понижает только слишком громкий звук. Минимум повышает
+        только слишком тихий звук. Точный уровень исправляет любое
+        отклонение больше 0,5 процентного пункта.
+      default: maximum
+      selector:
+        select:
+          options:
+            - label: "Понижать до заданного максимума"
+              value: maximum
+            - label: "Повышать до заданного минимума"
+              value: minimum
+            - label: "Поддерживать точный уровень"
+              value: fixed
+
+    volume_percent:
+      name: "Громкость в интервале"
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    outside_volume_enabled:
+      name: "Задавать громкость вне интервала"
+      description: >-
+        Если включено, вне интервала поддерживается указанный ниже уровень.
+        Например, ночью максимум 20%, а днём 40%. Работает только при
+        включённом управлении громкостью и вне запрета воспроизведения.
+      default: false
+      selector:
+        boolean: {}
+
+    outside_volume_percent:
+      name: "Громкость вне интервала"
+      default: 40
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: slider
+
+    playback_block_enabled:
+      name: "Запрещать воспроизведение по расписанию"
+      default: false
+      selector:
+        boolean: {}
+
+    playback_block_start:
+      name: "Начало запрета воспроизведения"
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    playback_block_end:
+      name: "Конец запрета воспроизведения"
+      default: "07:00:00"
+      selector:
+        time: {}
+
+    playback_block_action:
+      name: "Способ остановки воспроизведения"
+      description: >-
+        Авто выбирает первую поддерживаемую команду. Явно выбранная команда
+        выполняется только при наличии её поддержки у устройства.
+        Для Sonos можно выбрать паузу, чтобы сохранить позицию воспроизведения.
+      default: auto
+      selector:
+        select:
+          options:
+            - label: "Авто: остановка → пауза → выключение"
+              value: auto
+            - label: "Остановка"
+              value: media_stop
+            - label: "Пауза"
+              value: media_pause
+            - label: "Выключение"
+              value: turn_off
+
+    sonos_night_switches:
+      name: "Sonos: переключатели Night Sound"
+      description: >-
+        Необязательно. Выберите switch-сущности Night Sound / Ночной звук
+        из интеграции Sonos. Если список пуст, ночной режим не управляется.
+        Не выбирайте здесь переключатели будильников или питания.
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: switch
+              integration: sonos
+          multiple: true
+
+    sonos_night_start:
+      name: "Sonos: начало ночного режима"
+      default: "22:00:00"
+      selector:
+        time: {}
+
+    sonos_night_end:
+      name: "Sonos: конец ночного режима"
+      description: "Вне этого интервала выбранные переключатели Night Sound выключаются."
+      default: "08:00:00"
+      selector:
+        time: {}
+
+# Собственные команды тоже вызывают события. Последовательная обработка
+# и повторное чтение текущих состояний предотвращают отмену команд другим колонкам.
+mode: queued
+max: 50
+
+variables:
+  players: !input media_players
+  volume_enabled: !input volume_enabled
+  volume_start: !input volume_start
+  volume_end: !input volume_end
+  volume_mode: !input volume_mode
+  volume_percent: !input volume_percent
+  outside_volume_enabled: !input outside_volume_enabled
+  outside_volume_percent: !input outside_volume_percent
+  playback_block_enabled: !input playback_block_enabled
+  playback_block_start: !input playback_block_start
+  playback_block_end: !input playback_block_end
+  playback_block_action: !input playback_block_action
+  sonos_night_switches: !input sonos_night_switches
+  sonos_night_start: !input sonos_night_start
+  sonos_night_end: !input sonos_night_end
+
+triggers:
+  - trigger: state
+    entity_id: !input media_players
+    to: null
+    id: player_state
+
+  - trigger: state
+    entity_id: !input media_players
+    attribute: volume_level
+    id: player_volume
+
+  - trigger: state
+    entity_id: !input sonos_night_switches
+    to: null
+    id: sonos_night_state
+
+  - trigger: time
+    at:
+      - !input volume_start
+      - !input volume_end
+      - !input playback_block_start
+      - !input playback_block_end
+      - !input sonos_night_start
+      - !input sonos_night_end
+    id: schedule_boundary
+
+  - trigger: homeassistant
+    event: start
+    id: startup
+
+  - trigger: time_pattern
+    minutes: "/1"
+    id: periodic_check
+
+conditions: []
+
+actions:
+  - repeat:
+      for_each: "{{ players }}"
+      sequence:
+        - variables:
+            playback_block_active: >-
+              {% set current = now() %}
+              {% set start = today_at(playback_block_start) %}
+              {% set end = today_at(playback_block_end) %}
+              {{ playback_block_enabled and
+                 (start == end or (start <= current < end if start < end
+                                  else current >= start or current < end)) }}
+            volume_active: >-
+              {% set current = now() %}
+              {% set start = today_at(volume_start) %}
+              {% set end = today_at(volume_end) %}
+              {{ start == end or (start <= current < end if start < end
+                                  else current >= start or current < end) }}
+
+        - choose:
+            # Запрет имеет приоритет: громкость не повышается перед остановкой.
+            - conditions:
+                - condition: template
+                  value_template: "{{ playback_block_active }}"
+              sequence:
+                - if:
+                    - condition: template
+                      value_template: "{{ states(repeat.item) in ['playing', 'buffering'] }}"
+                  then:
+                    - variables:
+                        stop_action: >-
+                          {% set features = state_attr(repeat.item, 'supported_features') | int(0) %}
+                          {% if playback_block_action in ['auto', 'media_stop']
+                                and features | bitwise_and(4096) %}
+                            media_player.media_stop
+                          {% elif playback_block_action in ['auto', 'media_pause']
+                                  and features | bitwise_and(1) %}
+                            media_player.media_pause
+                          {% elif playback_block_action in ['auto', 'turn_off']
+                                  and features | bitwise_and(256) %}
+                            media_player.turn_off
+                          {% else %}
+                            none
+                          {% endif %}
+                    - if:
+                        - condition: template
+                          value_template: "{{ stop_action != 'none' }}"
+                      then:
+                        - action: "{{ stop_action }}"
+                          alias: "Остановить воспроизведение в запрещённое время"
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ repeat.item }}"
+
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {{ volume_enabled and (volume_active or outside_volume_enabled)
+                       and states(repeat.item) not in ['off', 'unknown', 'unavailable']
+                       and (state_attr(repeat.item, 'supported_features') | int(0)
+                            | bitwise_and(4)) != 0
+                       and is_number(state_attr(repeat.item, 'volume_level')) }}
+              sequence:
+                - variables:
+                    target_volume: >-
+                      {{ (volume_percent if volume_active else outside_volume_percent) | float(0) / 100 }}
+                    effective_mode: "{{ volume_mode if volume_active else 'fixed' }}"
+                - if:
+                    - condition: template
+                      value_template: >-
+                        {% set current = state_attr(repeat.item, 'volume_level') | float(0) %}
+                        {% set difference = current - target_volume %}
+                        {{ (effective_mode == 'maximum' and difference > 0.005)
+                           or (effective_mode == 'minimum' and difference < -0.005)
+                           or (effective_mode == 'fixed' and difference | abs > 0.005) }}
+                  then:
+                    - action: media_player.volume_set
+                      alias: "Применить громкость по расписанию"
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                      data:
+                        volume_level: "{{ target_volume }}"
+
+  - repeat:
+      for_each: "{{ sonos_night_switches }}"
+      sequence:
+        - variables:
+            sonos_night_active: >-
+              {% set current = now() %}
+              {% set start = today_at(sonos_night_start) %}
+              {% set end = today_at(sonos_night_end) %}
+              {{ start == end or (start <= current < end if start < end
+                                  else current >= start or current < end) }}
+        - if:
+            - condition: template
+              value_template: >-
+                {{ (sonos_night_active and is_state(repeat.item, 'off'))
+                   or (not sonos_night_active and is_state(repeat.item, 'on')) }}
+          then:
+            - action: "{{ 'switch.turn_on' if sonos_night_active else 'switch.turn_off' }}"
+              alias: "Применить ночной режим Sonos"
+              continue_on_error: true
+              target:
+                entity_id: "{{ repeat.item }}"

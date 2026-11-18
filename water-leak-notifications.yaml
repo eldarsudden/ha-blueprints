@@ -18,30 +18,42 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: binary_sensor
-              device_class: moisture
+          - domain:
+            - binary_sensor
+            device_class:
+            - moisture
           multiple: true
+          reorder: false
     active_alert:
       name: "Неподтверждённая протечка"
       description: "An input_boolean without a forced initial value, so its state is restored. Turning it off acknowledges the alert."
       selector:
         entity:
           filter:
-            - domain: input_boolean
+          - domain:
+            - input_boolean
+          multiple: false
+          reorder: false
     acknowledgment_token:
       name: "Контекст подтверждения"
       description: "An input_text helper with maximum length at least 100; leave its initial value unset."
       selector:
         entity:
           filter:
-            - domain: input_text
+          - domain:
+            - input_text
+          multiple: false
+          reorder: false
     rooms_memory:
       name: "Помещение последней протечки"
       description: "An input_text helper with maximum length at least 200; leave its initial value unset."
       selector:
         entity:
           filter:
-            - domain: input_text
+          - domain:
+            - input_text
+          multiple: false
+          reorder: false
     notification_actions:
       name: "Отправить уведомления"
       description: "Use alarm_message as the message, ack_action for the acknowledgment button, and notification_tag to replace earlier notifications."
@@ -57,7 +69,8 @@ blueprint:
       default:
         minutes: 5
       selector:
-        duration: {}
+        duration:
+          enable_second: true
 
 mode: restart
 

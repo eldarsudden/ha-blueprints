@@ -31,7 +31,10 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: binary_sensor
+          - domain:
+            - binary_sensor
+          multiple: false
+          reorder: false
 
     controlled_entities:
       name: "Управляемые устройства"
@@ -43,15 +46,16 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain:
-                - light
-                - switch
-                - fan
-                - climate
-                - humidifier
-                - media_player
-                - input_boolean
+          - domain:
+            - light
+            - switch
+            - fan
+            - climate
+            - humidifier
+            - media_player
+            - input_boolean
           multiple: true
+          reorder: false
 
     absence_delay:
       name: "Задержка выключения при отсутствии"
@@ -64,7 +68,8 @@ blueprint:
         minutes: 0
         seconds: 0
       selector:
-        duration: {}
+        duration:
+          enable_second: true
 
     pause_timers:
       name: "Таймер ручного приоритета (опционально)"
@@ -77,8 +82,10 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: timer
+          - domain:
+            - timer
           multiple: true
+          reorder: false
 
     manual_pause_duration:
       name: "Ручной приоритет после команды из Home Assistant"
@@ -86,7 +93,8 @@ blueprint:
       default:
         minutes: 30
       selector:
-        duration: {}
+        duration:
+          enable_second: true
 
 # Последовательная обработка не прерывает команды остальным устройствам.
 mode: queued

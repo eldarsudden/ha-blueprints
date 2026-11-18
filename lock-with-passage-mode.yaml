@@ -20,14 +20,21 @@ blueprint:
       description: Замок, который нужно закрыть.
       selector:
         entity:
-          domain: lock
+          domain:
+          - lock
+          multiple: false
+          reorder: false
     door_sensor:
       name: Датчик двери
       description: Датчик, который сообщает, что дверь закрыта.
       selector:
         entity:
-          domain: binary_sensor
-          device_class: door
+          domain:
+          - binary_sensor
+          device_class:
+          - door
+          multiple: false
+          reorder: false
     refresh_lock_on_door_change:
       name: Обновлять статус замка при изменении двери
       description: >
@@ -47,10 +54,11 @@ blueprint:
       default: 0
       selector:
         number:
-          min: 0
-          max: 600
-          unit_of_measurement: "сек"
+          min: 0.0
+          max: 600.0
+          unit_of_measurement: сек
           mode: box
+          step: 1.0
 
     check_interval:
       name: Интервал периодической проверки
@@ -59,7 +67,9 @@ blueprint:
         если он открыт и мы не в Passage Mode. Используйте формат /X (например, /15 для каждых 15 минут).
       default: "/15"
       selector:
-        text: {}
+        text:
+          multiline: false
+          multiple: false
     passage_mode:
       name: Passage Mode
       icon: mdi:door-open
@@ -83,20 +93,22 @@ blueprint:
               multiple: true
               mode: dropdown
               options:
-                - label: Понедельник
-                  value: mon
-                - label: Вторник
-                  value: tue
-                - label: Среда
-                  value: wed
-                - label: Четверг
-                  value: thu
-                - label: Пятница
-                  value: fri
-                - label: Суббота
-                  value: sat
-                - label: Воскресенье
-                  value: sun
+              - label: Понедельник
+                value: mon
+              - label: Вторник
+                value: tue
+              - label: Среда
+                value: wed
+              - label: Четверг
+                value: thu
+              - label: Пятница
+                value: fri
+              - label: Суббота
+                value: sat
+              - label: Воскресенье
+                value: sun
+              custom_value: false
+              sort: false
 
         passage_start_time:
           name: Начало интервала прохода

@@ -50,7 +50,9 @@ blueprint:
             Окна выбираются отдельно: управление всей областью не выполняется.
           default: ""
           selector:
-            area: {}
+            area:
+              multiple: false
+              reorder: false
         window_entities:
           name: "Окна"
           description: "Только выбранные cover-сущности будут открываться и закрываться."
@@ -58,7 +60,9 @@ blueprint:
             entity:
               multiple: true
               filter:
-                - domain: cover
+              - domain:
+                - cover
+              reorder: false
 
     opening_section:
       name: "Уровень открытия при проветривании"
@@ -76,7 +80,10 @@ blueprint:
           selector:
             entity:
               filter:
-                - domain: number
+              - domain:
+                - number
+              multiple: false
+              reorder: false
         sensor_opening_percentage:
           name: "Базовый Opening limit"
           description: >-
@@ -88,10 +95,10 @@ blueprint:
           default: 15
           selector:
             number:
-              min: 1
-              max: 100
-              step: 1
-              unit_of_measurement: "%"
+              min: 1.0
+              max: 100.0
+              step: 1.0
+              unit_of_measurement: '%'
               mode: slider
 
     outdoor_section:
@@ -113,56 +120,60 @@ blueprint:
             entity:
               multiple: true
               filter:
-                - domain: sensor
-                  device_class: temperature
+              - domain:
+                - sensor
+                device_class:
+                - temperature
+              reorder: false
         outdoor_warm_threshold:
           name: "100% базы при температуре от"
           default: 15
           selector:
             number:
-              min: -40
-              max: 40
+              min: -40.0
+              max: 40.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
               mode: box
         outdoor_cool_threshold:
           name: "75% базы при температуре от"
           default: 10
           selector:
             number:
-              min: -40
-              max: 40
+              min: -40.0
+              max: 40.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
               mode: box
         outdoor_cold_threshold:
           name: "50% базы при температуре от; ниже — 25%"
           default: 0
           selector:
             number:
-              min: -40
-              max: 40
+              min: -40.0
+              max: 40.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
               mode: box
         outdoor_hysteresis:
           name: "Запас температуры для увеличения открытия"
           default: 1
           selector:
             number:
-              min: 0
-              max: 5
+              min: 0.0
+              max: 5.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
+              mode: slider
         outdoor_warmup_seconds:
           name: "Стабильное потепление перед увеличением открытия"
           description: "Уменьшение лимита при похолодании применяется сразу; увеличение — после этой выдержки."
           default: 120
           selector:
             number:
-              min: 0
-              max: 1800
-              step: 30
+              min: 0.0
+              max: 1800.0
+              step: 30.0
               unit_of_measurement: s
               mode: box
 
@@ -181,16 +192,19 @@ blueprint:
             entity:
               multiple: true
               filter:
-                - domain: sensor
-                  device_class: carbon_dioxide
+              - domain:
+                - sensor
+                device_class:
+                - carbon_dioxide
+              reorder: false
         co2_open_threshold:
           name: "CO₂: открыть при превышении значения"
           default: 1200
           selector:
             number:
-              min: 0
-              max: 10000
-              step: 50
+              min: 0.0
+              max: 10000.0
+              step: 50.0
               unit_of_measurement: ppm
               mode: box
         co2_close_threshold:
@@ -199,9 +213,9 @@ blueprint:
           default: 800
           selector:
             number:
-              min: 0
-              max: 10000
-              step: 50
+              min: 0.0
+              max: 10000.0
+              step: 50.0
               unit_of_measurement: ppm
               mode: box
 
@@ -221,15 +235,17 @@ blueprint:
             entity:
               multiple: true
               filter:
-                - domain: sensor
+              - domain:
+                - sensor
+              reorder: false
         tvoc_open_threshold:
           name: "TVOC: открыть при превышении значения"
           default: 500
           selector:
             number:
-              min: 0
-              max: 100000
-              step: 1
+              min: 0.0
+              max: 100000.0
+              step: 1.0
               mode: box
         tvoc_close_threshold:
           name: "TVOC: закрыть при снижении ниже значения"
@@ -237,9 +253,9 @@ blueprint:
           default: 250
           selector:
             number:
-              min: 0
-              max: 100000
-              step: 1
+              min: 0.0
+              max: 100000.0
+              step: 1.0
               mode: box
 
     temperature_section:
@@ -259,17 +275,20 @@ blueprint:
             entity:
               multiple: true
               filter:
-                - domain: sensor
-                  device_class: temperature
+              - domain:
+                - sensor
+                device_class:
+                - temperature
+              reorder: false
         temperature_close_threshold:
           name: "Закрыть окно при снижении температуры ниже значения"
           default: 20
           selector:
             number:
-              min: 5
-              max: 35
+              min: 5.0
+              max: 35.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
               mode: box
         temperature_reopen_threshold:
           name: "Разрешить открытие при превышении заданной температуры"
@@ -277,10 +296,10 @@ blueprint:
           default: 22
           selector:
             number:
-              min: 5
-              max: 40
+              min: 5.0
+              max: 40.0
               step: 0.5
-              unit_of_measurement: "°C"
+              unit_of_measurement: °C
               mode: box
         temperature_close_delay:
           name: "Задержка закрытия при снижении температуры"
@@ -294,10 +313,10 @@ blueprint:
           default: 0
           selector:
             number:
-              min: 0
-              max: 60
+              min: 0.0
+              max: 60.0
               step: 0.5
-              unit_of_measurement: "мин"
+              unit_of_measurement: мин
               mode: box
 
 # Один запуск сопровождает открытые окна. Новые показания пробуждают ожидание,

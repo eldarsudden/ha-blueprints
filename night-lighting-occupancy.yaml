@@ -10,7 +10,9 @@ blueprint:
       name: Area
       description: "Выберите комнату, для которой будет работать сценарий"
       selector:
-        area: {}
+        area:
+          multiple: false
+          reorder: false
     night_mode_type:
       name: Night Mode Type
       description: "Какой режим использовать как ночной: Moonlight-mode (обычная лампа в лунном режиме) или Ambilight (только фоновая подсветка, если лампа её поддерживает)"
@@ -19,10 +21,13 @@ blueprint:
         select:
           mode: dropdown
           options:
-            - label: "Moonlight mode"
-              value: moonlight
-            - label: "Ambilight (фоновая подсветка)"
-              value: ambilight
+          - label: Moonlight mode
+            value: moonlight
+          - label: Ambilight (фоновая подсветка)
+            value: ambilight
+          multiple: false
+          custom_value: false
+          sort: false
     night_start:
       name: Start Time
       description: "Начало ночного режима"
@@ -41,7 +46,8 @@ blueprint:
       default:
         seconds: 60
       selector:
-        duration: {}
+        duration:
+          enable_second: true
 
     home_mode_entities:
       name: "Режим дома (опционально)"
@@ -53,8 +59,10 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: input_select
+          - domain:
+            - input_select
           multiple: true
+          reorder: false
     turn_off_main_in_ambilight:
       name: "Выключать основной свет при Ambilight"
       description: >-
@@ -67,12 +75,16 @@ blueprint:
       name: "Название режима сна"
       default: "Сон"
       selector:
-        text: {}
+        text:
+          multiline: false
+          multiple: false
     away_mode_value:
       name: "Название режима отсутствия"
       default: "Ушли"
       selector:
-        text: {}
+        text:
+          multiline: false
+          multiple: false
 
 mode: restart
 

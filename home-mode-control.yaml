@@ -17,23 +17,31 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: input_select
+          - domain:
+            - input_select
+          multiple: false
+          reorder: false
     away_mode_value:
       name: "Название режима отсутствия"
       default: "Ушли"
       selector:
-        text: {}
+        text:
+          multiline: false
+          multiple: false
     sleep_mode_value:
       name: "Название режима сна"
       default: "Сон"
       selector:
-        text: {}
+        text:
+          multiline: false
+          multiple: false
     lights_target:
       name: "Свет для выключения при уходе"
       selector:
         target:
           entity:
-            domain: light
+          - domain:
+            - light
     media_players:
       name: "Музыка для приостановки"
       description: "Only playing entities receive a pause command; idle, off and unavailable ones are skipped."
@@ -41,8 +49,10 @@ blueprint:
       selector:
         entity:
           filter:
-            - domain: media_player
+          - domain:
+            - media_player
           multiple: true
+          reorder: false
 
 mode: restart
 

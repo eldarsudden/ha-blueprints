@@ -43,7 +43,7 @@ class PlayerSchedule:
             return result
         return value
 
-    def run(self, hour="23:00:00"):
+    def run(self, hour="23:00:00", trigger=None):
         current = datetime.fromisoformat("2026-11-18T" + hour)
         self.env.globals.update(now=lambda: current, today_at=lambda value: datetime.combine(
             current.date(), datetime.strptime(value, "%H:%M:%S").time()))
@@ -82,7 +82,10 @@ class PlayerSchedule:
                 else:
                     raise AssertionError(step)
 
-        execute(self.bp["actions"], self.render(self.bp["variables"], {}))
+        variables = self.render(self.bp["variables"], {})
+        if trigger is not None:
+            variables["trigger"] = trigger
+        execute(self.bp["actions"], variables)
         return commands
 
 
@@ -107,9 +110,45 @@ class PlaybackBlock(unittest.TestCase):
             self.assertEqual(self.actions(schedule.run()), ["media_player.volume_set", "media_player.media_stop"])
             self.assertEqual(schedule.run(), [])
 
+    def test_muted_yandex_station_keeps_reported_volume_without_repeated_commands(self):
+        schedule = PlayerSchedule(state="paused", volume=0.25, features=5)
+        player = schedule.players["media_player.test"]
+        player["is_volume_muted"] = True
+        self.assertEqual(schedule.run(trigger={"id": "periodic_check"}), [])
+        self.assertEqual(schedule.run(trigger={"id": "player_mute"}), [])
+        player["is_volume_muted"] = False
+        self.assertEqual(self.actions(schedule.run(trigger={"id": "player_mute"})),
+                         ["media_player.volume_set", "media_player.media_pause"])
+
+    def test_new_playback_stops_only_the_triggering_player_even_when_silent(self):
+        for state in ["playing", "buffering"]:
+            for volume, muted in [(0, False), (0.25, True)]:
+                with self.subTest(state=state, volume=volume, muted=muted):
+                    schedule = PlayerSchedule(state=state, volume=volume, features=5)
+                    player = schedule.players["media_player.test"]
+                    player["is_volume_muted"] = muted
+                    schedule.inputs["media_players"].append("media_player.other")
+                    schedule.players["media_player.other"] = player.copy()
+                    trigger = dict(id="player_state", entity_id="media_player.test", to_state=dict(state=state))
+                    self.assertEqual(schedule.run(trigger=trigger),
+                                     [("media_player.media_pause", "media_player.test", {})])
+                    self.assertEqual(schedule.run(trigger={"id": "periodic_check"}), [])
+                    player["state"] = "paused"
+                    self.assertEqual(schedule.run(trigger=trigger), [])
+
+    def test_block_start_and_startup_stop_already_playing_silent_device(self):
+        schedule = PlayerSchedule(state="playing", volume=0)
+        for event in ["playback_block_start", "startup"]:
+            self.assertEqual(self.actions(schedule.run(hour="22:00:00", trigger={"id": event})),
+                             ["media_player.media_stop"])
+        self.assertEqual(schedule.run(trigger={"id": "schedule_boundary"}), [])
+
     def test_volume_events_are_monitored(self):
         triggers = load("media-player-schedule-control.yaml")["triggers"]
-        self.assertTrue(any(t.get("attribute") == "volume_level" for t in triggers))
+        for attribute in ("volume_level", "is_volume_muted"):
+            self.assertTrue(any(t.get("attribute") == attribute for t in triggers))
+        start = next(t for t in triggers if t["id"] == "playback_block_start")
+        self.assertEqual(start["at"], {"input": "playback_block_start"})
 
     def test_unknown_volume_is_set_without_waiting_for_a_numeric_report(self):
         for volume in [None, "unknown"]:

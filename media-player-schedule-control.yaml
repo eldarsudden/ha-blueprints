@@ -22,14 +22,15 @@ blueprint:
     команд на самом устройстве. Без поддерживаемой команды запрет не работает.
 
     Для колонок с некорректным статусом есть способ «Громкость 0% + остановка».
-    Он поддерживает нулевую громкость независимо от статуса воспроизведения,
+    Он заглушает колонку независимо от статуса воспроизведения,
     включая off и unknown, и работает даже при выключенном обычном управлении
-    громкостью. При ненулевом или неизвестном уровне сначала задаёт 0%, затем
+    громкостью. Если устройство сообщает mute или уровень 0%, оно уже заглушено.
+    В остальных случаях при поддержке volume_set сначала задаёт 0%, затем
     отправляет поддерживаемую команду остановки, паузы или выключения.
-    Попытка повысить громкость запускает эти команды повторно. Если уровень
-    уже равен нулю, повторных команд нет. Недоступные устройства пропускаются.
-    Требуется поддержка volume_set; без команды остановки остаётся только
-    снижение громкости. Предыдущая громкость не сохраняется и не восстанавливается.
+    При переходе колонки в playing или buffering команда остановки отправляется
+    даже при выключенном звуке. Уже играющие колонки также проверяются в начале
+    запрета и при запуске Home Assistant. Недоступные устройства пропускаются.
+    Если остановка не поддерживается, остаётся только снижение громкости. Предыдущая громкость не сохраняется и не восстанавливается.
     После запрета обычное расписание громкости может снова сделать звук слышимым,
     если воспроизведение продолжилось без звука.
 
@@ -155,10 +156,9 @@ blueprint:
         Авто выбирает первую поддерживаемую команду. Явно выбранная команда
         выполняется только при наличии её поддержки у устройства.
         Для Sonos можно выбрать паузу, чтобы сохранить позицию воспроизведения.
-        «Громкость 0% + остановка» не зависит от статуса воспроизведения:
-        при каждой попытке поднять громкость возвращает 0% и повторно
-        останавливает устройство поддерживаемой командой, как в режиме Авто.
-        Если громкость уже нулевая, ничего не отправляет.
+        «Громкость 0% + остановка» учитывает mute и нулевой уровень.
+        При заглушении и при новом запуске воспроизведения применяется
+        поддерживаемая команда, как в режиме Авто.
       default: auto
       selector:
         select:
@@ -171,7 +171,7 @@ blueprint:
               value: media_pause
             - label: "Выключение"
               value: turn_off
-            - label: "Громкость 0% + остановка (без проверки статуса)"
+            - label: "Громкость 0% + остановка"
               value: volume_zero
 
     sonos_night_switches:
@@ -235,6 +235,11 @@ triggers:
     id: player_volume
 
   - trigger: state
+    entity_id: !input media_players
+    attribute: is_volume_muted
+    id: player_mute
+
+  - trigger: state
     entity_id: !input sonos_night_switches
     to: null
     id: sonos_night_state
@@ -243,11 +248,14 @@ triggers:
     at:
       - !input volume_start
       - !input volume_end
-      - !input playback_block_start
       - !input playback_block_end
       - !input sonos_night_start
       - !input sonos_night_end
     id: schedule_boundary
+
+  - trigger: time
+    at: !input playback_block_start
+    id: playback_block_start
 
   - trigger: homeassistant
     event: start
@@ -288,6 +296,7 @@ actions:
                     zero_volume_required: >-
                       {{ playback_block_action == 'volume_zero'
                          and states(repeat.item) != 'unavailable'
+                         and state_attr(repeat.item, 'is_volume_muted') != true
                          and (state_attr(repeat.item, 'supported_features') | int(0)
                               | bitwise_and(4)) != 0
                          and (not is_number(state_attr(repeat.item, 'volume_level'))
@@ -306,9 +315,15 @@ actions:
                 - if:
                     - condition: template
                       value_template: >-
+                        {% set active = ['playing', 'buffering'] %}
+                        {% set event = trigger.id | default('') if trigger is defined else '' %}
                         {{ zero_volume_required
-                           or (playback_block_action != 'volume_zero'
-                               and states(repeat.item) in ['playing', 'buffering']) }}
+                           or (states(repeat.item) in active
+                               and (playback_block_action != 'volume_zero'
+                                    or event in ['playback_block_start', 'startup']
+                                    or (event == 'player_state' and trigger.entity_id == repeat.item
+                                        and trigger.to_state is not none
+                                        and trigger.to_state.state in active))) }}
                   then:
                     - variables:
                         stop_action: >-

@@ -7,6 +7,9 @@ blueprint:
     В интервале громкости можно понижать её до заданного максимума,
     повышать до заданного минимума или поддерживать точный уровень.
     Ручное изменение за допустимый предел исправляется автоматически.
+    Для колонок со ступенчатой громкостью можно указать шаг. Максимум
+    округляется вниз, минимум вверх, фиксированный уровень — до ближайшего
+    доступного значения (при равном расстоянии выбирается более тихое).
     Вне интервала можно поддерживать другой заданный уровень; по умолчанию
     громкость остаётся как есть. Предыдущее значение не сохраняется.
     Обычное управление громкостью не затрагивает выключенные устройства
@@ -132,6 +135,33 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
+    volume_step_percent:
+      name: "Шаг громкости устройства"
+      description: >-
+        Для колонок с уровнями 0%, 10%, 20% и далее укажите 10.
+        При цели 35% команда установит 30%, а при максимуме 25% — 20%.
+        Значение 1 сохраняет обычную точность.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+          mode: box
+
+    stepped_volume_players:
+      name: "Колонки с указанным шагом громкости"
+      description: >-
+        Выберите колонки из списка устройств воспроизведения, к которым
+        применяется шаг. Пустой список применяет его ко всем устройствам расписания.
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: true
+
     playback_block_enabled:
       name: "Запрещать воспроизведение по расписанию"
       default: false
@@ -215,6 +245,8 @@ variables:
   volume_percent: !input volume_percent
   outside_volume_enabled: !input outside_volume_enabled
   outside_volume_percent: !input outside_volume_percent
+  volume_step_percent: !input volume_step_percent
+  stepped_volume_players: !input stepped_volume_players
   playback_block_enabled: !input playback_block_enabled
   playback_block_start: !input playback_block_start
   playback_block_end: !input playback_block_end
@@ -360,9 +392,20 @@ actions:
                        and is_number(state_attr(repeat.item, 'volume_level')) }}
               sequence:
                 - variables:
-                    target_volume: >-
-                      {{ (volume_percent if volume_active else outside_volume_percent) | float(0) / 100 }}
                     effective_mode: "{{ volume_mode if volume_active else 'fixed' }}"
+                    target_volume: >-
+                      {% set percent = (volume_percent if volume_active else outside_volume_percent) | float(0) %}
+                      {% set step = volume_step_percent | int(1) %}
+                      {% if step <= 1 or (stepped_volume_players and repeat.item not in stepped_volume_players)
+                            or percent == 100 or percent % step == 0 %}
+                        {{ percent / 100 }}
+                      {% else %}
+                        {% set lower = percent - percent % step %}
+                        {% set upper = [lower + step, 100] | min %}
+                        {% set use_lower = effective_mode == 'maximum' or
+                           (effective_mode == 'fixed' and percent - lower <= upper - percent) %}
+                        {{ (lower if use_lower else upper) / 100 }}
+                      {% endif %}
                 - if:
                     - condition: template
                       value_template: >-

@@ -210,5 +210,48 @@ class PlaybackBlock(unittest.TestCase):
                          [("media_player.volume_set", "media_player.test", {"volume_level": 0.4})])
 
 
+class VolumeSteps(unittest.TestCase):
+    def test_morning_boundary_converges_after_station_report(self):
+        station = "media_player.test"
+        other = "media_player.other"
+        schedule = PlayerSchedule(volume=0, playback_block_end="08:00:00",
+                                  outside_volume_enabled=True, outside_volume_percent=35,
+                                  volume_step_percent=10, stepped_volume_players=[station])
+        schedule.inputs["media_players"].append(other)
+        schedule.players[other] = schedule.players[station].copy()
+        self.assertEqual(schedule.run("07:59:59"), [])
+        self.assertEqual(schedule.run("08:00:00", {"id": "schedule_boundary"}), [
+            ("media_player.volume_set", station, {"volume_level": 0.3}),
+            ("media_player.volume_set", other, {"volume_level": 0.35}),
+        ])
+        for trigger in ["player_volume", "schedule_boundary", "periodic_check"]:
+            self.assertEqual(schedule.run("08:00:01", {"id": trigger}), [])
+        schedule.players[station]["volume_level"] = 0.4
+        self.assertEqual(schedule.run("08:00:02", {"id": "player_volume"}),
+                         [("media_player.volume_set", station, {"volume_level": 0.3})])
+        self.assertEqual(schedule.run("08:00:03", {"id": "player_volume"}), [])
+
+    def test_step_respects_limits_and_available_endpoints(self):
+        for mode, target, step, current, expected in [
+            ("maximum", 25, 10, 0.3, 0.2), ("maximum", 25, 10, 0.1, 0.1),
+            ("minimum", 25, 10, 0.2, 0.3), ("minimum", 25, 10, 0.4, 0.4),
+            ("fixed", 36, 10, 0, 0.4), ("fixed", 34, 10, 1, 0.3),
+            ("minimum", 30, 10, 0.2, 0.3), ("maximum", 100, 30, 1, 1),
+            ("fixed", 97, 30, 0, 1), ("fixed", 95, 30, 0, 0.9),
+            ("fixed", 0, 10, 0.1, 0),
+        ]:
+            with self.subTest(mode=mode, target=target, step=step, current=current):
+                schedule = PlayerSchedule(volume=current, volume_mode=mode, volume_percent=target,
+                                          volume_step_percent=step, playback_block_enabled=False)
+                schedule.run("21:00:00")
+                self.assertEqual(schedule.players["media_player.test"]["volume_level"], expected)
+                self.assertEqual(schedule.run("21:00:01"), [])
+
+    def test_existing_schedule_keeps_percent_precision(self):
+        schedule = PlayerSchedule(volume=0.3, outside_volume_enabled=True, outside_volume_percent=35)
+        self.assertEqual(schedule.run("08:00:00"),
+                         [("media_player.volume_set", "media_player.test", {"volume_level": 0.35})])
+
+
 if __name__ == "__main__":
     unittest.main()

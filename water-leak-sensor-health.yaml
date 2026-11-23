@@ -50,7 +50,7 @@ variables:
   sensors: !input moisture_sensors
   memory: !input reported_sensors
   delay_minutes: !input delay_minutes
-  previous: "{{ states(memory).split(',') | reject('equalto', '') | sort | list }}"
+  previous: "{{ states(memory).split(',') | reject('equalto', '') | sort | list if has_value(memory) else [] }}"
   affected: >-
     {% set ns = namespace(ids=[]) %}
     {% for entity in sensors | unique %}
@@ -65,7 +65,7 @@ variables:
     {{ ns.ids | sort | list }}
 conditions:
   - condition: template
-    value_template: "{{ has_value(memory) and affected != previous }}"
+    value_template: "{{ states[memory] is not none and not is_state(memory, 'unavailable') and affected != previous }}"
 actions:
   - variables:
       health_tag: "leak_sensor_health_{{ this.entity_id.split('.')[1] }}"

@@ -1,0 +1,102 @@
+blueprint:
+  name: "Датчики протечки — контроль доступности"
+  description: >-
+    Если датчик длительно показывает unknown или unavailable, выводит в HA
+    список помещений и выполняет выбранные действия оповещения. Когда все
+    датчики снова сообщают «сухо» или «мокро», снимает предупреждение.
+    Проверка раз в минуту обнаруживает также сбои, начавшиеся до установки.
+  domain: automation
+  source_url: https://github.com/eldarsudden/ha-blueprints/blob/master/water-leak-sensor-health.yaml
+  input:
+    moisture_sensors:
+      name: Датчики протечки
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+              device_class: moisture
+          multiple: true
+    delay_minutes:
+      name: Предупредить через
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: мин
+          mode: box
+    reported_sensors:
+      name: Память оповещения
+      description: >-
+        Выберите отдельный текстовый помощник длиной 255 символов без
+        начального значения. Список entity_id через запятую должен в нём помещаться.
+      selector:
+        entity:
+          filter:
+            - domain: input_text
+    notify_actions:
+      name: Дополнительные оповещения
+      description: Для текста используйте health_message, для тега — health_tag.
+      default: []
+      selector:
+        action: {}
+
+mode: single
+max_exceeded: silent
+triggers:
+  - trigger: time_pattern
+    minutes: "/1"
+variables:
+  sensors: !input moisture_sensors
+  memory: !input reported_sensors
+  delay_minutes: !input delay_minutes
+  previous: "{{ states(memory).split(',') | reject('equalto', '') | sort | list }}"
+  affected: >-
+    {% set ns = namespace(ids=[]) %}
+    {% for entity in sensors | unique %}
+      {% if states(entity) not in ['on', 'off'] %}
+        {% set s = states[entity] %}
+        {% if entity in previous or s is none or
+              (now() - s.last_changed).total_seconds() >= delay_minutes | float * 60 %}
+          {% set ns.ids = ns.ids + [entity] %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.ids | sort | list }}
+conditions:
+  - condition: template
+    value_template: "{{ has_value(memory) and affected != previous }}"
+actions:
+  - variables:
+      health_tag: "leak_sensor_health_{{ this.entity_id.split('.')[1] }}"
+      health_message: >-
+        {% if affected %}
+          {% set ns = namespace(names=[]) %}
+          {% for entity in affected %}
+            {% set ns.names = ns.names + [area_name(entity) or state_attr(entity,'friendly_name') or entity] %}
+          {% endfor %}
+          Нет достоверного состояния датчика протечки: {{ ns.names | unique | join(', ') }}.
+          Проверьте датчик и связь с ним.
+        {% else %}
+          Все контролируемые датчики снова передают состояние протечки.
+        {% endif %}
+  - if:
+      - condition: template
+        value_template: "{{ affected | length > 0 }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "{{ health_tag }}"
+          title: "Проверка датчиков протечки"
+          message: "{{ health_message }}"
+    else:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: "{{ health_tag }}"
+  - choose: []
+    default: !input notify_actions
+  - action: input_text.set_value
+    target:
+      entity_id: !input reported_sensors
+    data:
+      value: "{{ affected | join(',') }}"
